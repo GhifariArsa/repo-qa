@@ -1,4 +1,4 @@
-# codex-graph-extension
+# Repo-QA
 
 A repository-level code-QA benchmark whose ground truth is **derived from a
 codebase's graph structure**, not mined from GitHub issues (SWE-QA), Stack
@@ -14,28 +14,28 @@ Pipeline: `pyan3 static analysis -> CodexGraph-schema graph (+ CALLS) -> Neo4j
 Follows the CodexGraph schema (Liu et al., 2024, [arXiv:2408.03910](https://arxiv.org/abs/2408.03910))
 with two deliberate additions, both marked below.
 
-| Nodes | Attributes |
-|---|---|
-| `REPOSITORY` | **our addition** — scopes a multi-repo database |
-| `MODULE` | `name` (dotted), `file_path` |
-| `CLASS` | `name`, `file_path`, `signature`, `code_ref` |
-| `FUNCTION` | `name`, `file_path`, `signature`, `code_ref` |
-| `METHOD` | as FUNCTION, plus `class_qname` |
-| `FIELD` | `name`, `file_path`, `class_qname` |
-| `GLOBAL_VARIABLE` | `name`, `file_path`, `code_ref` |
+| Nodes             | Attributes                                      |
+| ----------------- | ----------------------------------------------- |
+| `REPOSITORY`      | **our addition** — scopes a multi-repo database |
+| `MODULE`          | `name` (dotted), `file_path`                    |
+| `CLASS`           | `name`, `file_path`, `signature`, `code_ref`    |
+| `FUNCTION`        | `name`, `file_path`, `signature`, `code_ref`    |
+| `METHOD`          | as FUNCTION, plus `class_qname`                 |
+| `FIELD`           | `name`, `file_path`, `class_qname`              |
+| `GLOBAL_VARIABLE` | `name`, `file_path`, `code_ref`                 |
 
-| Edges | Direction |
-|---|---|
-| `CONTAINS` | `REPOSITORY -> MODULE` (**our addition**), `MODULE -> CLASS \| FUNCTION \| GLOBAL_VARIABLE` |
-| `HAS_METHOD` | `CLASS -> METHOD` |
-| `HAS_FIELD` | `CLASS -> FIELD` |
-| `INHERITS` | `CLASS -> CLASS` |
-| `USES` | `FUNCTION \| METHOD -> GLOBAL_VARIABLE \| FIELD`, with `access` = read/write |
-| `CALLS` | `FUNCTION \| METHOD -> FUNCTION \| METHOD` (**our addition**) |
+| Edges        | Direction                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------- |
+| `CONTAINS`   | `REPOSITORY -> MODULE` (**our addition**), `MODULE -> CLASS \| FUNCTION \| GLOBAL_VARIABLE` |
+| `HAS_METHOD` | `CLASS -> METHOD`                                                                           |
+| `HAS_FIELD`  | `CLASS -> FIELD`                                                                            |
+| `INHERITS`   | `CLASS -> CLASS`                                                                            |
+| `USES`       | `FUNCTION \| METHOD -> GLOBAL_VARIABLE \| FIELD`, with `access` = read/write                |
+| `CALLS`      | `FUNCTION \| METHOD -> FUNCTION \| METHOD` (**our addition**)                               |
 
 `CALLS` is the substantive extension. CodexGraph's own authors flag its absence:
-*"adding edges related to function calls will enhance the broader applicability
-of CodexGraph."* Tiers 2, 3 and 5 are largely unaskable without it.
+_"adding edges related to function calls will enhance the broader applicability
+of CodexGraph."_ Tiers 2, 3 and 5 are largely unaskable without it.
 
 Following the paper, `code_ref` stores a **pointer** into the source
 (`path:start-end`), not the snippet text.
@@ -74,13 +74,13 @@ rejects exactly the 2 artifacts (`tests/test_extract.py` asserts both sets exact
 Per-tier labels are carried on every record. Report per-tier accuracy; do not
 flatten to a single score.
 
-| Tier | Name | Templates |
-|---|---|---|
-| 1 | existence / lookup | entity type, method owner, defining file, direct base, has field |
-| 2 | path traversal | path exists, shortest chain, hop count, reachable-within-2, reaches-global-read |
-| 3 | aggregation over shape | fan-in, fan-out, reachability-set size, nearest common ancestor, max fan-in, method count |
-| 4 | counterfactual / negative | absent entity, no call path, wrong method owner, no callers, not-inherits |
-| 5 | cross-graph composition | CALLS closure × USES — **reduced scope, off by default** (see below) |
+| Tier | Name                      | Templates                                                                                 |
+| ---- | ------------------------- | ----------------------------------------------------------------------------------------- |
+| 1    | existence / lookup        | entity type, method owner, defining file, direct base, has field                          |
+| 2    | path traversal            | path exists, shortest chain, hop count, reachable-within-2, reaches-global-read           |
+| 3    | aggregation over shape    | fan-in, fan-out, reachability-set size, nearest common ancestor, max fan-in, method count |
+| 4    | counterfactual / negative | absent entity, no call path, wrong method owner, no callers, not-inherits                 |
+| 5    | cross-graph composition   | CALLS closure × USES — **reduced scope, off by default** (see below)                      |
 
 **Tier 4 negatives are deliberately plausible.** Absent entities recombine a
 real short name with a real namespace from the same repo
@@ -124,11 +124,11 @@ negative tier penalises yes-bias.
 
 - **Static analysis ceiling.** Dynamic dispatch, `getattr`, decorators that
   rewrap, and monkey-patching are invisible. `CALLS` is sound-ish but not
-  complete; questions are ground truth *with respect to the extracted graph*,
+  complete; questions are ground truth _with respect to the extracted graph_,
   which is the honest claim to make in the paper.
 - **Calls into third-party or stdlib code are excluded** — only in-repo targets
   become edges.
-- **Tier 5 is reduced in scope.** The stretch goal was CALLS × *data-flow*. There
+- **Tier 5 is reduced in scope.** The stretch goal was CALLS × _data-flow_. There
   is no data-flow extraction here, so tier 5 composes CALLS with the data-access
   graph (`USES`, read/write). That is genuine two-graph composition but is **not**
   data-flow and must not be reported as such. Off by default; `--include-tier5`.
@@ -138,8 +138,8 @@ negative tier penalises yes-bias.
 - **Contamination filtering by creation date is a weak proxy** (see
   `select/repos.py`): recent repos can vendor older code, cutoffs are approximate,
   and high-star recent repos are likelier to have been scraped. A **fully
-  synthetic repo** is flagged as the only contamination-proof source and is *not
-  built* — it trades away ecological validity, so it belongs as a control arm.
+  synthetic repo** is flagged as the only contamination-proof source and is _not
+  built_ — it trades away ecological validity, so it belongs as a control arm.
 
 ## Layout
 
