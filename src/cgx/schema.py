@@ -96,6 +96,19 @@ EDGE_ENDPOINTS: dict[str, set[tuple[str, str]]] = {
 # --------------------------------------------------------------------------
 
 
+#: Attributes that form part of an edge's IDENTITY, not just its payload.
+#:
+#: Two USES edges between the same pair are distinct facts when one is a read
+#: and the other a write -- a method that both reads and writes a field does
+#: both, and tier-5 questions filter on exactly this attribute. Without it in
+#: the MERGE key, Neo4j keeps one relationship and the last write wins, so the
+#: graph silently claims the method only ever writes (or only ever reads).
+#: On Django that collapsed 510 edges.
+EDGE_IDENTITY_ATTRS: dict[str, tuple[str, ...]] = {
+    USES: ("access",),
+}
+
+
 @dataclass
 class Node:
     """A graph node.

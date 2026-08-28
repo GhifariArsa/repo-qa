@@ -25,9 +25,11 @@ spelled ``User`` at the call site but resolves to ``User.__init__``.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..logconfig import get_logger
 from ..schema import (
     CALLS,
     Edge,
@@ -37,6 +39,8 @@ from ..schema import (
     Node,
     USES,
 )
+
+log = get_logger(__name__)
 
 #: pyan flavors that correspond to a callable in our schema.
 _CALLABLE_FLAVORS = {"FUNCTION", "METHOD", "STATICMETHOD", "CLASSMETHOD"}
@@ -54,19 +58,32 @@ def run_pyan_pass(
     repo_id: str,
     py_files: list[Path],
     package_root: Path,
-    nodes: dict[str, Node],
+    nodes,                                 # NodeIndex from the AST pass
     call_sites: dict[str, dict[str, list[int]]],
 ) -> PyanResult:
     from pyan.analyzer import CallGraphVisitor
 
-    logger = logging.getLogger("cgx.pyan")
-    logger.setLevel(logging.CRITICAL)      # pyan is extremely chatty at INFO
+    pyan_logger = logging.getLogger("cgx.pyan.internal")
+    pyan_logger.setLevel(logging.CRITICAL)   # pyan is extremely chatty at INFO
 
-    visitor = CallGraphVisitor(
-        [str(p) for p in py_files],
-        root=str(package_root),
-        logger=logger,
-    )
+    log.info("pyan pass: resolving names across %d file(s) — this is the slow step",
+             len(py_files))
+    started = time.monotonic()
+    try:
+        visitor = CallGraphVisitor(
+            [str(p) for p in py_files],
+            root=str(package_root),
+            logger=pyan_logger,
+        )
+    except SyntaxError as exc:
+        # Should be unreachable now that only parsed files reach this pass, but
+        # a named file beats a raw traceback from inside pyan if it ever fires.
+        raise SystemExit(
+            f"pyan could not build a symbol table: {exc.filename}:{exc.lineno}: {exc.msg}. "
+            f"Exclude this file or fix it, then re-run."
+        ) from exc
+    log.info("pyan pass: name resolution finished in %.1fs (%d namespace(s))",
+             time.monotonic() - started, len(visitor.nodes))
 
     result = PyanResult()
     seen: set[tuple[str, str, str]] = set()
@@ -79,7 +96,7 @@ def run_pyan_pass(
         # (1) drop inheritance and other class-body edges outright
         if src_flavor not in _CALLABLE_FLAVORS:
             continue
-        src_node = nodes.get(src.get_name())
+        src_node = nodes.get(src.get_name(), FUNCTION, METHOD)
         if src_node is None:
             continue
         caller_calls = call_sites.get(src_node.qname, {})
@@ -93,8 +110,8 @@ def run_pyan_pass(
 
             # --- global variable reads -> USES ---------------------------
             if tgt_flavor == "NAME":
-                tgt_node = nodes.get(tgt_qname)
-                if tgt_node is None or tgt_node.label != GLOBAL_VARIABLE:
+                tgt_node = nodes.get(tgt_qname, GLOBAL_VARIABLE)
+                if tgt_node is None:
                     continue
                 _emit(
                     result, seen, USES, src_node, tgt_node, repo_id,
@@ -111,14 +128,14 @@ def run_pyan_pass(
             call_kind = "direct"
             if tgt_flavor == "CLASS":
                 ctor_qname = f"{tgt_qname}.__init__"
-                ctor = nodes.get(ctor_qname)
-                if ctor is None or ctor.label != METHOD:
+                ctor = nodes.get(ctor_qname, METHOD)
+                if ctor is None:
                     continue           # class has no __init__ in this repo
                 tgt_node = ctor
                 call_kind = "constructor"
             elif tgt_flavor in _CALLABLE_FLAVORS:
-                tgt_node = nodes.get(tgt_qname)
-                if tgt_node is None or tgt_node.label not in (FUNCTION, METHOD):
+                tgt_node = nodes.get(tgt_qname, FUNCTION, METHOD)
+                if tgt_node is None:
                     continue
                 if tgt_node.name == "__init__":
                     call_kind = "constructor"
@@ -135,6 +152,17 @@ def run_pyan_pass(
                 result, seen, CALLS, src_node, tgt_node, repo_id,
                 call_kind=call_kind, line=line, resolver="pyan",
             )
+
+    for src_q, tgt_q, why in result.rejected_calls[:20]:
+        log.debug("  rejected CALLS %s -> %s (%s)", src_q, tgt_q, why)
+    log.info(
+        "pyan pass: %d CALLS, %d USES->global from %d resolved edge(s); "
+        "%d rejected by the call-site cross-check",
+        sum(1 for e in result.edges if e.type == CALLS),
+        sum(1 for e in result.edges if e.type == USES),
+        n_resolved,
+        len(result.rejected_calls),
+    )
 
     result.stats = {
         "pyan_resolved_edges": n_resolved,

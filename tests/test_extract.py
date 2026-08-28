@@ -171,3 +171,68 @@ def test_schema_validation_rejects_dangling_edges():
                       edges=[Edge(type=CONTAINS, source=mod.id, target="nope", repo_id="r")])
     with pytest.raises(SchemaError, match="dangling target"):
         validate_graph(graph)
+
+
+# ---------------------------------------------------------------------------
+# Regression: FIELD/METHOD qname collisions
+# ---------------------------------------------------------------------------
+
+COLLIDING_SOURCE = '''
+class Connection:
+    def __init__(self, sock):
+        self._socket = sock          # defines a FIELD  pkg.mod.Connection._socket
+
+    @property
+    def _socket(self):               # defines a METHOD pkg.mod.Connection._socket
+        return self.__sock
+
+    @_socket.setter
+    def _socket(self, value):
+        self.__sock = value
+
+    def close(self):
+        self._socket.close()
+'''
+
+
+def _extract_source(tmp_path, source: str, repo_id="collide"):
+    from cgx.extract.pipeline import extract_repo
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "mod.py").write_text(source)
+    return extract_repo(repo_id, pkg, tmp_path)
+
+
+def test_property_and_attribute_sharing_a_qname_both_survive(tmp_path):
+    """`self._socket = x` and `@property def _socket` are one qname, two nodes.
+
+    Keying the node index by qname alone made the second registration return
+    the first node, so a HAS_METHOD edge pointed at a FIELD and extraction of
+    any repo using properties failed schema validation outright.
+    """
+    graph, _ = _extract_source(tmp_path, COLLIDING_SOURCE)
+    by_qname = {}
+    for node in graph.nodes:
+        by_qname.setdefault(node.qname, set()).add(node.label)
+
+    labels = by_qname["pkg.mod.Connection._socket"]
+    assert labels == {"FIELD", "METHOD"}, labels
+
+
+def test_collision_edges_point_at_the_right_label(tmp_path):
+    graph, _ = _extract_source(tmp_path, COLLIDING_SOURCE)
+    ids = by_id(graph)
+    for edge in graph.edges:
+        src, tgt = ids[edge.source], ids[edge.target]
+        if edge.type == "HAS_METHOD":
+            assert tgt.label == "METHOD", f"HAS_METHOD -> {tgt.label} ({tgt.qname})"
+        if edge.type == "HAS_FIELD":
+            assert tgt.label == "FIELD", f"HAS_FIELD -> {tgt.label} ({tgt.qname})"
+
+
+def test_colliding_repo_passes_schema_validation(tmp_path):
+    """extract_repo() calls validate_graph() internally — this used to raise."""
+    graph, _ = _extract_source(tmp_path, COLLIDING_SOURCE)
+    assert len(graph.nodes) > 0 and len(graph.edges) > 0

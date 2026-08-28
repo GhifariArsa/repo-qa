@@ -10,6 +10,11 @@ CREATE CONSTRAINT global_variable_id IF NOT EXISTS FOR (n:GLOBAL_VARIABLE) REQUI
 
 // Every node also carries :CodeNode so questions can traverse without knowing
 // the label up front, and so repo-scoped lookups hit one index.
+// `id` MUST be indexed on :CodeNode, not only per-label. Ingest resolves edge
+// endpoints with `MATCH (s:CodeNode {id: ...})`, and the per-label uniqueness
+// constraints above do not cover that lookup -- without this index the planner
+// falls back to NodeByLabelScan and edge ingest becomes O(nodes x edges).
+CREATE INDEX codenode_id IF NOT EXISTS FOR (n:CodeNode) ON (n.id);
 CREATE INDEX codenode_repo IF NOT EXISTS FOR (n:CodeNode) ON (n.repo_id);
 CREATE INDEX codenode_qname IF NOT EXISTS FOR (n:CodeNode) ON (n.qname);
 CREATE INDEX codenode_name IF NOT EXISTS FOR (n:CodeNode) ON (n.name);

@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 
 from .config import load_config
+from .logconfig import setup_logging
 from .extract.pipeline import extract_repo, write_graph
 from .graph.client import client as graph_client
 from .graph.ingest import ingest as ingest_graph, load_graph_json
@@ -32,11 +33,16 @@ def extract(
     repo: str = typer.Argument(..., help="repo id from config/repos.yaml"),
     config: Path = typer.Option(Path("config/repos.yaml"), "--config"),
     out: Path = typer.Option(None, "--out"),
+    include_tests: bool = typer.Option(
+        False, "--include-tests", help="also extract test directories (excluded by default)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="per-file detail"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="warnings and errors only"),
 ):
     """Static-analyse a repo into a CodexGraph-schema graph JSON."""
+    setup_logging(verbose=verbose, quiet=quiet)
     cfg = load_config(config)
     rc = cfg.repo(repo)
-    graph, meta = extract_repo(rc.id, rc.path, rc.package_root)
+    graph, meta = extract_repo(rc.id, rc.path, rc.package_root, include_tests=include_tests)
     path = write_graph(graph, out or _graph_path(rc.id))
     typer.echo(json.dumps(meta["stats"], indent=2))
     if meta["rejected_calls"]:
@@ -72,8 +78,11 @@ def generate(
     seed: int = typer.Option(0, "--seed"),
     include_tier5: bool = typer.Option(False, "--include-tier5"),
     out: Path = typer.Option(None, "--out"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    quiet: bool = typer.Option(False, "--quiet", "-q"),
 ):
     """Generate tier-labelled Q&A pairs from the graph."""
+    setup_logging(verbose=verbose, quiet=quiet)
     cfg = load_config(config)
     tiers = (1, 2, 3, 4, 5) if include_tier5 else (1, 2, 3, 4)
     with graph_client(cfg.neo4j) as c:

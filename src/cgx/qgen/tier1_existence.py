@@ -141,18 +141,93 @@ MATCH (c:CLASS {repo_id: $repo, qname: $class})
 RETURN exists((c)-[:HAS_FIELD]->(:FIELD {name: $field})) AS has_field
 """
 
+#: Candidate negatives: a field name that is real *somewhere else* in the repo,
+#: paired with a class that neither defines nor inherits it.
+#:
+#: Sampling only from existing HAS_FIELD edges made this template answer True
+#: every time, which meant the answer was predictable from the template alone --
+#: a model could score on it without consulting the graph, and any proxy that
+#: correlates with template identity (phrasing, persona, tier) leaked it too.
+#: The negatives are built on the same near-miss principle as
+#: `t4_absent_entity`: both halves occur in the repo, the pairing does not.
+#:
+#: Inheritance is excluded when *selecting* a negative, so the question is never
+#: confusing about defines-vs-inherits. The stored ground-truth query is still
+#: the plain direct-definition check the question asks.
+#: Anchors for negatives, drawn separately and combined in Python.
+#:
+#: The obvious query -- every (class, field-name-from-elsewhere) pair, filtered
+#: by a NOT-inherits check -- is a cross product: 10,423,524 rows on Django,
+#: each carrying a variable-length inheritance traversal. It never finished.
+#: Sampling a bounded set of classes and a bounded set of field names, then
+#: testing only those combinations, is the same distribution at a fraction of
+#: the cost.
+_SAMPLE_CLASSES_FOR_FIELDS = """
+MATCH (c:CLASS {repo_id: $repo})
+RETURN c.qname AS qname
+ORDER BY c.qname
+"""
+
+_SAMPLE_FIELD_NAMES = """
+MATCH (:CLASS {repo_id: $repo})-[:HAS_FIELD]->(f:FIELD)
+RETURN DISTINCT f.name AS name
+ORDER BY f.name
+"""
+
+#: Absent means neither defined nor inherited, so the question is never
+#: ambiguous about defines-vs-inherits. The stored ground-truth query stays the
+#: plain direct-definition check the question actually asks.
+_GT_FIELD_ABSENT_INCL_INHERITED = """
+MATCH (c:CLASS {repo_id: $repo, qname: $class})
+OPTIONAL MATCH (c)-[:INHERITS*0..8]->(:CLASS)-[:HAS_FIELD]->(f:FIELD {name: $field})
+RETURN count(f) = 0 AS absent
+"""
+
+
+def _sample_absent_field_pairs(client, repo_id, rng, wanted, attempts=200):
+    classes = [r["qname"] for r in client.run(_SAMPLE_CLASSES_FOR_FIELDS, repo=repo_id)]
+    names = [r["name"] for r in client.run(_SAMPLE_FIELD_NAMES, repo=repo_id)]
+    if not classes or not names:
+        return []
+    out, seen = [], set()
+    for _ in range(attempts):
+        if len(out) >= wanted:
+            break
+        cand = (rng.choice(classes), rng.choice(names))
+        if cand in seen:
+            continue
+        seen.add(cand)
+        res = client.run(_GT_FIELD_ABSENT_INCL_INHERITED, repo=repo_id,
+                         **{"class": cand[0], "field": cand[1]})
+        if res and res[0]["absent"]:
+            out.append({"class": cand[0], "field": cand[1]})
+    return out
+
+
+def _has_field_question(client, repo_id, index, cls, field):
+    ans = client.run(_GT_HAS_FIELD, repo=repo_id, **{"class": cls, "field": field})[0]["has_field"]
+    return make_question(
+        tier=1, template_id="t1_has_field", repo_id=repo_id, index=index,
+        question=f"Does the class `{cls}` define an attribute named `{field}`?",
+        answer=bool(ans), answer_type="bool",
+        cypher=_GT_HAS_FIELD, params={"repo": repo_id, "class": cls, "field": field},
+        evidence={"class": cls, "field": field,
+                  "polarity": "positive" if ans else "near_miss_negative"},
+    )
+
 
 @template("t1_has_field", 1)
 def t1_has_field(client, repo_id, limit, rng: random.Random):
-    rows = pick(rng, client.run(_SAMPLE_FIELDS, repo=repo_id), limit)
+    """Roughly balanced True/False, so the answer is not predictable from the template."""
+    n_positive = (limit + 1) // 2
+    n_negative = limit - n_positive
+
     out = []
-    for i, row in enumerate(rows):
-        ans = client.run(_GT_HAS_FIELD, repo=repo_id, **{"class": row["class"], "field": row["field"]})[0]["has_field"]
-        out.append(make_question(
-            tier=1, template_id="t1_has_field", repo_id=repo_id, index=i,
-            question=f"Does the class `{row['class']}` define an attribute named `{row['field']}`?",
-            answer=bool(ans), answer_type="bool",
-            cypher=_GT_HAS_FIELD, params={"repo": repo_id, "class": row["class"], "field": row["field"]},
-            evidence={"class": row["class"], "field": row["field"]},
-        ))
+    for row in pick(rng, client.run(_SAMPLE_FIELDS, repo=repo_id), n_positive):
+        out.append(_has_field_question(client, repo_id, len(out), row["class"], row["field"]))
+
+    for row in _sample_absent_field_pairs(client, repo_id, rng, n_negative):
+        rec = _has_field_question(client, repo_id, len(out), row["class"], row["field"])
+        if rec.answer is False:           # the selection query should guarantee this
+            out.append(rec)
     return out

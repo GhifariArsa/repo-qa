@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..schema import EDGE_TYPES, NODE_LABELS
+from ..schema import EDGE_IDENTITY_ATTRS, EDGE_TYPES, NODE_LABELS
 from .client import GraphClient
 
 _BATCH = 1000
@@ -63,25 +63,33 @@ def ingest(client: GraphClient, graph: dict, replace: bool = True) -> dict[str, 
     for etype, rows in by_type.items():
         if etype not in EDGE_TYPES:
             raise ValueError(f"refusing to ingest unknown edge type {etype!r}")
-        # Split the structural keys from the edge's own attributes (call_kind,
-        # line, access, ...) so the latter can be written with a single `+=`.
+        # Identity attributes go INTO the MERGE pattern; everything else is
+        # payload written with a single `+=`. See EDGE_IDENTITY_ATTRS.
+        identity = EDGE_IDENTITY_ATTRS.get(etype, ())
         payload = [
             {
                 "source": r["source"],
                 "target": r["target"],
+                "keys": {k: r.get(f"attr_{k}") for k in identity},
                 "props": {
                     k: v for k, v in r.items() if k not in ("type", "source", "target")
                 },
             }
             for r in rows
         ]
+        key_pattern = ", ".join(f"{k}: row.keys.{k}" for k in identity)
+        merge = (
+            f"MERGE (s)-[r:{etype} {{{key_pattern}}}]->(t)"
+            if identity
+            else f"MERGE (s)-[r:{etype}]->(t)"
+        )
         for chunk in _chunks(payload, _BATCH):
             client.run(
                 f"""
                 UNWIND $rows AS row
                 MATCH (s:CodeNode {{id: row.source}})
                 MATCH (t:CodeNode {{id: row.target}})
-                MERGE (s)-[r:{etype}]->(t)
+                {merge}
                 SET r += row.props
                 """,
                 rows=chunk,

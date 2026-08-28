@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
+
+from ..logconfig import get_logger
 
 from ..schema import (
     CONTAINS,
@@ -18,19 +21,52 @@ from ..schema import (
 from .ast_pass import run_ast_pass
 from .pyan_pass import run_pyan_pass
 
-DEFAULT_EXCLUDES = {
+log = get_logger(__name__)
+
+#: Directories never walked. Beyond the obvious build/VCS noise, test
+#: directories are excluded by default for three reasons: questions about a
+#: repo's structure are about its library code, not its fixtures; test trees
+#: dominate file counts on real projects (Django is ~60% tests), which would
+#: skew every sampled question toward them; and test suites deliberately
+#: contain pathological code -- Django ships `tests_syntax_error.py` precisely
+#: because it must not parse.
+#:
+#: This is a coverage decision, not a neutral default: the benchmark then makes
+#: no claim about test code. Pass `include_tests=True` (CLI: `--include-tests`)
+#: to keep them.
+BUILD_EXCLUDES = {
     ".git", ".venv", "venv", "__pycache__", "build", "dist",
     ".tox", ".mypy_cache", ".pytest_cache", "node_modules",
 }
+#: Deliberately does NOT include "fixtures": it is too ambiguous a name to
+#: exclude repo-wide, and plenty of libraries ship real code under it.
+TEST_EXCLUDES = {"tests", "test", "testing"}
+DEFAULT_EXCLUDES = BUILD_EXCLUDES | TEST_EXCLUDES
 
 
-def discover_python_files(repo_root: Path, excludes: set[str] | None = None) -> list[Path]:
-    excludes = excludes or DEFAULT_EXCLUDES
-    files = []
+def discover_python_files(
+    repo_root: Path,
+    excludes: set[str] | None = None,
+    include_tests: bool = False,
+) -> list[Path]:
+    if excludes is None:
+        excludes = BUILD_EXCLUDES if include_tests else DEFAULT_EXCLUDES
+    files, excluded = [], 0
     for path in sorted(repo_root.rglob("*.py")):
-        if any(part in excludes for part in path.parts):
+        # Match on components RELATIVE to the repo root. Matching absolute path
+        # components would mean a repo that merely happens to live under a
+        # directory called `tests/` (or `build/`, or `dist/`) extracts to an
+        # empty graph, silently, depending only on where it sits on disk.
+        # Only directory components count, so a module named `test_utils.py`
+        # is kept while anything under a `tests/` directory is dropped.
+        relative = path.relative_to(repo_root)
+        if any(part in excludes for part in relative.parts[:-1]):
+            excluded += 1
             continue
         files.append(path)
+    if excluded:
+        log.info("skipped %d file(s) in excluded directories (%s)",
+                 excluded, ", ".join(sorted(excludes & TEST_EXCLUDES)) or "build dirs")
     return files
 
 
@@ -38,16 +74,34 @@ def extract_repo(
     repo_id: str,
     repo_path: Path,
     package_root: Path,
+    include_tests: bool = False,
 ) -> tuple[CodeGraph, dict]:
     repo_path = Path(repo_path).resolve()
     package_root = Path(package_root).resolve()
-    py_files = discover_python_files(repo_path)
+    started = time.monotonic()
+    log.info("extracting %r from %s", repo_id, repo_path)
+
+    py_files = discover_python_files(repo_path, include_tests=include_tests)
     if not py_files:
         raise SystemExit(f"no Python files found under {repo_path}")
+    log.info("discovered %d Python file(s) (package root: %s)", len(py_files), package_root)
 
     ast_result = run_ast_pass(repo_id, py_files, package_root, repo_path)
+
+    # Only files that parsed go to pyan — see AstResult.parsed_files.
+    skipped = len(py_files) - len(ast_result.parsed_files)
+    if skipped:
+        log.warning(
+            "%d file(s) excluded from the graph because they do not parse; "
+            "the extracted graph does not represent them",
+            skipped,
+        )
+    if not ast_result.parsed_files:
+        raise SystemExit(f"no parseable Python files under {repo_path}")
+
     pyan_result = run_pyan_pass(
-        repo_id, py_files, package_root, ast_result.nodes, ast_result.call_sites
+        repo_id, ast_result.parsed_files, package_root,
+        ast_result.nodes, ast_result.call_sites,
     )
 
     # REPOSITORY node + CONTAINS to every module (our addition to the schema).
@@ -69,10 +123,15 @@ def extract_repo(
     edges += pyan_result.edges
 
     graph = CodeGraph(repo_id=repo_id, nodes=nodes, edges=edges)
+    log.info("validating %d node(s) and %d edge(s) against the schema",
+             len(nodes), len(edges))
     validate_graph(graph)
+    log.info("extraction complete in %.1fs", time.monotonic() - started)
 
     stats = {
         "files": len(py_files),
+        "files_parsed": len(ast_result.parsed_files),
+        "tests_included": include_tests,
         "nodes_total": len(nodes),
         "edges_total": len(edges),
         "nodes_by_label": _count(n.label for n in nodes),

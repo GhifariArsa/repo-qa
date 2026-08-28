@@ -94,9 +94,17 @@ def t4_no_call_path(client, repo_id, limit, rng: random.Random):
     calls = callables(client, repo_id)
     if len(calls) < 2:
         return []
-    pairs = [(a["qname"], b["qname"]) for a in calls for b in calls if a["qname"] != b["qname"]]
+    # Draw pairs at random instead of materialising the full pair space:
+    # Django has 9225 callables, so that space is 85,100,625 tuples.
+    names = [c["qname"] for c in calls]
+    pairs, seen = [], set()
+    for _ in range(max(limit * 20, 200)):
+        a, b = rng.choice(names), rng.choice(names)
+        if a != b and (a, b) not in seen:
+            seen.add((a, b))
+            pairs.append((a, b))
     out = []
-    for source, target in pick(rng, pairs, max(limit * 6, 40)):
+    for source, target in pairs:
         res = client.run(_GT_PATH_EXISTS, repo=repo_id, source=source, target=target)
         if not res or res[0]["reachable"]:
             continue
@@ -119,12 +127,18 @@ def t4_no_call_path(client, repo_id, limit, rng: random.Random):
 # Method attributed to the wrong class
 # --------------------------------------------------------------------------
 
-_SAMPLE_CLASS_METHOD_PAIRS = """
-MATCH (owner:CLASS {repo_id: $repo})-[:HAS_METHOD]->(m:METHOD)
-MATCH (other:CLASS {repo_id: $repo})
-WHERE other <> owner AND NOT m.name STARTS WITH '__'
-RETURN other.qname AS class, m.name AS method
-ORDER BY other.qname, m.name
+#: Classes and method names are drawn separately and paired in Python. The
+#: joined form (every class x every method defined elsewhere) is 12,150,672
+#: rows on Django -- ten seconds merely to COUNT, and all of it shipped to the
+#: client so ~20 could be kept.
+_SAMPLE_CLASSES = """
+MATCH (c:CLASS {repo_id: $repo}) RETURN c.qname AS qname ORDER BY c.qname
+"""
+
+_SAMPLE_METHOD_NAMES = """
+MATCH (:CLASS {repo_id: $repo})-[:HAS_METHOD]->(m:METHOD)
+WHERE NOT m.name STARTS WITH '__'
+RETURN DISTINCT m.name AS name ORDER BY m.name
 """
 
 _GT_CLASS_HAS_METHOD = """
@@ -136,9 +150,19 @@ RETURN count(m) > 0 AS has_method
 
 @template("t4_wrong_method_owner", 4)
 def t4_wrong_method_owner(client, repo_id, limit, rng: random.Random):
-    rows = client.run(_SAMPLE_CLASS_METHOD_PAIRS, repo=repo_id)
-    out = []
-    for row in pick(rng, rows, max(limit * 4, 20)):
+    classes = [r["qname"] for r in client.run(_SAMPLE_CLASSES, repo=repo_id)]
+    names = [r["name"] for r in client.run(_SAMPLE_METHOD_NAMES, repo=repo_id)]
+    if not classes or not names:
+        return []
+    out, seen = [], set()
+    for _ in range(max(limit * 20, 200)):
+        if len(out) >= limit:
+            break
+        row = {"class": rng.choice(classes), "method": rng.choice(names)}
+        key = (row["class"], row["method"])
+        if key in seen:
+            continue
+        seen.add(key)
         res = client.run(_GT_CLASS_HAS_METHOD, repo=repo_id, **{"class": row["class"], "method": row["method"]})
         if not res or res[0]["has_method"]:
             continue                      # it does have it, by definition or inheritance

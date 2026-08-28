@@ -18,6 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..logconfig import get_logger
 from ..schema import (
     CLASS,
     CONTAINS,
@@ -36,9 +37,59 @@ from ..schema import (
 )
 
 
+log = get_logger(__name__)
+
+#: Order used when a caller looks a qname up without saying what kind of thing
+#: it expects. Containers first, then callables, then values.
+_RESOLUTION_ORDER = (MODULE, CLASS, FUNCTION, METHOD, GLOBAL_VARIABLE, FIELD)
+
+
+class NodeIndex:
+    """Nodes keyed by (label, qname), not by qname alone.
+
+    A qname is NOT unique on its own. The commonest case in real Python is a
+    property: `self._socket = sock` in `__init__` defines a FIELD, and
+    `@property def _socket` defines a METHOD -- same qualified name, two
+    different kinds of node. Keying by qname alone meant the second `add()`
+    silently returned the first node, so a HAS_METHOD edge could end up aimed
+    at a FIELD and `validate_graph` rejected the whole repo.
+
+    The graph schema already distinguishes them: `make_id()` keys on label and
+    qname, so both nodes coexist happily once they are indexed separately.
+    """
+
+    def __init__(self) -> None:
+        self._by_key: dict[tuple[str, str], Node] = {}
+
+    def add(self, node: Node) -> Node:
+        """Register `node`; first writer wins for a given (label, qname)."""
+        return self._by_key.setdefault((node.label, node.qname), node)
+
+    def get(self, qname: str, *labels: str) -> Node | None:
+        """Look up `qname`, preferring the given labels in order.
+
+        Callers that know what they expect (a base class, a call target, a
+        global) should say so -- that is what makes the lookup unambiguous.
+        """
+        for label in labels or _RESOLUTION_ORDER:
+            hit = self._by_key.get((label, qname))
+            if hit is not None:
+                return hit
+        return None
+
+    def has(self, qname: str, label: str) -> bool:
+        return (label, qname) in self._by_key
+
+    def values(self):
+        return self._by_key.values()
+
+    def __len__(self) -> int:
+        return len(self._by_key)
+
+
 @dataclass
 class AstResult:
-    nodes: dict[str, Node] = field(default_factory=dict)          # qname -> Node
+    nodes: NodeIndex = field(default_factory=NodeIndex)
     edges: list[Edge] = field(default_factory=list)
     #: callable qname -> {callee short name -> [line numbers]}
     call_sites: dict[str, dict[str, list[int]]] = field(default_factory=dict)
@@ -46,6 +97,12 @@ class AstResult:
     bases: dict[str, list[str]] = field(default_factory=dict)
     #: class qname -> {field short name -> field qname}
     fields_by_class: dict[str, dict[str, str]] = field(default_factory=dict)
+    #: Files that actually parsed. The pyan pass must be given THIS list, not
+    #: the discovered one: pyan builds a symbol table with `symtable.symtable()`,
+    #: which raises on a file that does not compile and takes the whole
+    #: extraction down with it. Real repos ship such files on purpose -- Django
+    #: has `tests_syntax_error.py` to exercise its own test runner.
+    parsed_files: list[Path] = field(default_factory=list)
 
 
 def module_qname(py_file: Path, package_root: Path) -> str:
@@ -119,8 +176,7 @@ class _ModuleVisitor(ast.NodeVisitor):
     # -- helpers ---------------------------------------------------------
 
     def _add(self, node: Node) -> Node:
-        self.r.nodes.setdefault(node.qname, node)
-        return self.r.nodes[node.qname]
+        return self.r.nodes.add(node)
 
     def _edge(self, etype: str, src: Node, tgt: Node, **attrs) -> None:
         self.r.edges.append(
@@ -192,7 +248,7 @@ class _ModuleVisitor(ast.NodeVisitor):
             )
         )
         if self._at_module_level:
-            self._edge(CONTAINS, self.r.nodes[self.mod], cls)
+            self._edge(CONTAINS, self.r.nodes.get(self.mod, MODULE), cls)
         self.raw_bases[qname] = list(node.bases)
         self.r.fields_by_class.setdefault(qname, {})
 
@@ -262,9 +318,9 @@ class _ModuleVisitor(ast.NodeVisitor):
             )
         )
         if is_method:
-            self._edge(HAS_METHOD, self.r.nodes[cls_qname], fn)
+            self._edge(HAS_METHOD, self.r.nodes.get(cls_qname, CLASS), fn)
         elif self._at_module_level:
-            self._edge(CONTAINS, self.r.nodes[self.mod], fn)
+            self._edge(CONTAINS, self.r.nodes.get(self.mod, MODULE), fn)
 
         self.r.call_sites.setdefault(qname, defaultdict(list))
         self.stack.append(("func", qname))
@@ -300,7 +356,7 @@ class _ModuleVisitor(ast.NodeVisitor):
                         module_qname=self.mod,
                     )
                 )
-                self._edge(CONTAINS, self.r.nodes[self.mod], gv)
+                self._edge(CONTAINS, self.r.nodes.get(self.mod, MODULE), gv)
         self.generic_visit(node)
 
     visit_Assign = _visit_assign
@@ -316,7 +372,7 @@ class _ModuleVisitor(ast.NodeVisitor):
             and isinstance(node.value, ast.Name)
             and node.value.id == "self"
         ):
-            cls = self.r.nodes.get(cls_qname)
+            cls = self.r.nodes.get(cls_qname, CLASS)
             if cls is not None:
                 if isinstance(node.ctx, ast.Store):
                     self._add_field(cls, node.attr, node)
@@ -369,8 +425,8 @@ class _FieldUseVisitor(ast.NodeVisitor):
             and node.value.id == "self"
         ):
             target_q = self.resolve_field(cls_qname, node.attr)
-            fn = self.r.nodes.get(fn_qname)
-            fld = self.r.nodes.get(target_q) if target_q else None
+            fn = self.r.nodes.get(fn_qname, FUNCTION, METHOD)
+            fld = self.r.nodes.get(target_q, FIELD) if target_q else None
             if fn is not None and fld is not None:
                 access = "write" if isinstance(node.ctx, ast.Store) else "read"
                 key = (fn_qname, target_q, access)
@@ -401,17 +457,24 @@ def run_ast_pass(
     """Parse every file, emit structural nodes/edges, resolve bases and fields."""
     result = AstResult()
     parsed: list[tuple[str, ast.Module, _ModuleVisitor]] = []
+    unparseable: list[str] = []
+    log.info("AST pass: parsing %d file(s)", len(py_files))
 
-    for py_file in py_files:
+    for n, py_file in enumerate(py_files, 1):
         mod = module_qname(py_file, package_root)
         rel_path = str(py_file.resolve().relative_to(repo_root.resolve()))
         source = py_file.read_text(encoding="utf-8", errors="replace")
         try:
             tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
+        except SyntaxError as exc:
+            # Previously swallowed. A file that does not parse contributes no
+            # nodes or edges, so every question derived from this repo is built
+            # on a graph that is silently missing it -- say so.
+            unparseable.append(rel_path)
+            log.warning("skipping %s — does not parse: %s (line %s)",
+                        rel_path, exc.msg, exc.lineno)
             continue
-        result.nodes.setdefault(
-            mod,
+        result.nodes.add(
             Node(
                 id=make_id(repo_id, MODULE, mod),
                 label=MODULE,
@@ -420,26 +483,40 @@ def run_ast_pass(
                 repo_id=repo_id,
                 file_path=rel_path,
                 module_qname=mod,
-            ),
+            )
         )
         visitor = _ModuleVisitor(result, repo_id, mod, rel_path)
         visitor.visit(tree)
         parsed.append((mod, tree, visitor))
+        result.parsed_files.append(py_file)
+        log.debug("  parsed %s (%s)", mod, rel_path)
+        if n % 50 == 0:
+            log.info("  ...%d/%d files, %d nodes so far", n, len(py_files), len(result.nodes))
+
+    log.info("AST pass: %d file(s) parsed, %d node(s)%s",
+             len(parsed), len(result.nodes),
+             f", {len(unparseable)} unparseable" if unparseable else "")
 
     # --- resolve INHERITS once every class in the repo is known ---------
+    n_inherits = 0
+    unresolved_bases = 0
     for mod, _tree, visitor in parsed:
         for cls_qname, base_exprs in visitor.raw_bases.items():
             resolved: list[str] = []
             for base in base_exprs:
                 target = _resolve_base(base, mod, visitor.imports, result.nodes)
                 if target is None:
+                    # Almost always a third-party or stdlib base class, which is
+                    # out of scope by design rather than a failure.
+                    unresolved_bases += 1
                     continue
                 resolved.append(target)
+                n_inherits += 1
                 result.edges.append(
                     Edge(
                         type=INHERITS,
-                        source=result.nodes[cls_qname].id,
-                        target=result.nodes[target].id,
+                        source=result.nodes.get(cls_qname, CLASS).id,
+                        target=result.nodes.get(target, CLASS).id,
                         repo_id=repo_id,
                     )
                 )
@@ -460,8 +537,13 @@ def run_ast_pass(
             queue.extend(result.bases.get(current, []))
         return None
 
+    log.info("AST pass: %d INHERITS edge(s) resolved in-repo, %d base(s) outside the repo",
+             n_inherits, unresolved_bases)
+
+    before = len(result.edges)
     for mod, tree, _visitor in parsed:
         _FieldUseVisitor(result, repo_id, mod, resolve_field).visit(tree)
+    log.info("AST pass: %d USES edge(s) to fields", len(result.edges) - before)
 
     return result
 
@@ -470,7 +552,7 @@ def _resolve_base(
     base: ast.expr,
     mod: str,
     imports: dict[str, str],
-    nodes: dict[str, Node],
+    nodes: "NodeIndex",
 ) -> str | None:
     """Map a base-class expression to an in-repo class qname, or None."""
     if isinstance(base, ast.Name):
@@ -485,7 +567,6 @@ def _resolve_base(
     else:
         return None
     for cand in candidates:
-        node = nodes.get(cand)
-        if node is not None and node.label == CLASS:
+        if nodes.has(cand, CLASS):
             return cand
     return None
