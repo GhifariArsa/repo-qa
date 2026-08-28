@@ -1,0 +1,15 @@
+# Target-repo registry. `cgx extract --repo <id>` resolves against this file.
+neo4j:
+  uri: bolt://localhost:7687
+  user: neo4j
+  password: cgxpassword
+  database: neo4j
+
+repos:
+  - id: minirepo
+    path: fixtures/minirepo
+    package_root: fixtures        # dir that the top-level package sits inside
+    # contamination metadata (Phase 4 populates these for real repos)
+    created_at: null
+    last_commit_at: null
+    source: fixture

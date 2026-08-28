@@ -1,0 +1,21 @@
+services:
+  neo4j:
+    image: neo4j:5.26
+    container_name: cgx-neo4j
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/cgxpassword
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes:
+      - cgx-neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p cgxpassword 'RETURN 1' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  cgx-neo4j-data:
