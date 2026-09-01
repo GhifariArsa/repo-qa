@@ -25,12 +25,57 @@ import json
 import subprocess
 from pathlib import Path
 
-#: Rough public training-cutoff dates, for the `post_cutoff` flag only.
+#: Published training-data cutoffs, checked 2026-09-01.
+#:
+#: These are SECONDARY sources -- aggregator sites and vendor help pages -- and
+#: they disagree with each other on several models (see CONTESTED_CUTOFFS).
+#: Before any of this reaches the paper, re-verify each entry against the
+#: vendor's own model card or API docs, and record the date you checked: these
+#: values move with every point release.
+#:
+#: Note the distinction the vendors themselves draw: the *training* cutoff is
+#: the last date any data was included, while the *reliable knowledge* cutoff
+#: is the date through which the model answers dependably, and is usually
+#: earlier because the final months are thin. For contamination purposes the
+#: training cutoff is the conservative choice, and it is what is listed here.
 KNOWN_CUTOFFS = {
-    "claude-opus-4.5": "2025-02-01",
-    "gpt-5": "2024-10-01",
-    "gemini-2.5-pro": "2025-01-01",
+    # Anthropic
+    "claude-opus-5": "2026-05-01",
+    "claude-sonnet-5": "2026-01-01",
+    "claude-fable-5": "2026-01-01",
+    # OpenAI -- the GPT-5.6 family shares one cutoff (officially 2026-02-16)
+    "gpt-5.6-sol": "2026-02-16",
+    "gpt-5.6-terra": "2026-02-16",
+    "gpt-5.6-luna": "2026-02-16",
+    "gpt-5.5": "2025-12-01",
+    # Open weights
+    "qwen3.6-27b": "2025-10-01",
+    "qwen3": "2025-01-01",
+    "deepseek-v4-pro": "2025-06-01",
+    "llama-4-maverick": "2024-08-01",
 }
+
+#: Models whose published cutoff could not be pinned down to a single value.
+#: Deliberately kept OUT of KNOWN_CUTOFFS: a contamination filter built on a
+#: disputed date gives false assurance, which is worse than no filter at all.
+CONTESTED_CUTOFFS = {
+    "gemini-3-pro": ["2025-01", "2025-11"],      # sources disagree by 10 months
+    "gemini-3.6-flash": ["2025-11", "2026-03"],
+    "grok-4.3": ["2024-11", "2025-12"],          # sources disagree by 13 months
+    "grok-4.5": ["2026-02-01"],                  # single source only
+    "qwen3.8": [],                               # no published cutoff found at all
+}
+
+
+def strictest_cutoff() -> str:
+    """The latest cutoff among known models.
+
+    A repository is only contamination-resistant with respect to a model if it
+    postdates THAT model's cutoff, so a benchmark evaluated on several models
+    must clear the latest one. Filtering on an average or an older model's date
+    would let contaminated repos through for the newest evaluator.
+    """
+    return max(KNOWN_CUTOFFS.values())
 
 
 def find_candidates(

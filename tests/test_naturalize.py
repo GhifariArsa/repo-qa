@@ -66,6 +66,60 @@ def _naturalize(rec, vocab, phrasings, same_answer=True, judge=True):
     return n.naturalize(rec, vocab), provider
 
 
+def _path_record(repo="minirepo"):
+    """A t2_shortest_chain-shaped record: endpoints qualified, chain of three."""
+    from cgx.qgen.base import make_question
+
+    chain = ["pkg.a.Alpha.start", "pkg.b.Middle.hop", "pkg.c.Omega.finish"]
+    return make_question(
+        tier=2, template_id="t2_shortest_chain", repo_id=repo, index=0,
+        question=("What is the shortest chain of calls from `pkg.a.Alpha.start` to "
+                  "`pkg.c.Omega.finish`? List every callable on the path in order."),
+        answer=chain, answer_type="path",
+        cypher="RETURN 1", params={"repo": repo, "source": chain[0], "target": chain[-1]},
+    )
+
+
+def test_path_endpoints_are_not_treated_as_leaked_answer():
+    """The endpoints ARE the question -- naming them cannot be a leak.
+
+    Counting them made every t2_shortest_chain rewrite that shortened a
+    qualified name fall back to the template, silently costing the tier its
+    natural phrasings.
+    """
+    from cgx.qgen.validate import check_answer_leak
+
+    rec = _path_record()
+    rewrite = ("I'm tracing through start and trying to work out how execution could "
+               "reach finish from there. What's the shortest call sequence?")
+    assert check_answer_leak(rec, rewrite) == []
+
+
+def test_interior_path_node_is_still_a_leak():
+    """Only the interior of the chain is the answer -- it must stay protected."""
+    from cgx.qgen.validate import check_answer_leak
+
+    rec = _path_record()
+    assert check_answer_leak(rec, "Does it go via `pkg.b.Middle.hop`?")
+    assert check_answer_leak(rec, "Does it go via Middle.hop?")
+
+
+def test_common_word_short_names_do_not_false_positive():
+    """`set` is a verb as well as a method name; bare prose use is not a leak."""
+    from cgx.qgen.base import make_question
+    from cgx.qgen.validate import check_answer_leak
+
+    rec = make_question(
+        tier=2, template_id="t2_shortest_chain", repo_id="minirepo", index=0,
+        question="What is the shortest chain from `pkg.a.Alpha.start` to `pkg.c.Omega.finish`?",
+        answer=["pkg.a.Alpha.start", "pkg.b.Cache.set", "pkg.c.Omega.finish"],
+        answer_type="path", cypher="RETURN 1", params={"repo": "minirepo"},
+    )
+    assert check_answer_leak(rec, "Give me the set of steps from start to finish.") == []
+    assert check_answer_leak(rec, "Does it pass through `set`?")          # code context
+    assert check_answer_leak(rec, "Does it pass through Cache.set?")      # dotted
+
+
 def test_good_rewrite_is_accepted_and_template_preserved(fan_in_question, vocab):
     good = ("I'm about to change the constructor of `minirepo.models.Base` — how many "
             "functions or methods call `minirepo.models.Base.__init__` directly?")

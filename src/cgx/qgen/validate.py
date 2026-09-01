@@ -82,8 +82,22 @@ def _answer_tokens(rec: QuestionRecord) -> list[str]:
         return []
     if rec.answer_type == "count":
         return [str(rec.answer)]
-    if rec.answer_type in ("list", "path"):
-        tokens: list[str] = []
+    if rec.answer_type == "path":
+        # The endpoints of a path ARE the question -- "what is the chain from A
+        # to B" must name A and B. Only the interior nodes are the answer, so
+        # only they can be leaked. Counting the endpoints made every
+        # t2_shortest_chain rewrite that shortened a qualified name look like a
+        # leak, and fall back to the template.
+        chain = [str(x) for x in (rec.answer or [])]
+        interior = chain[1:-1]
+        tokens = []
+        for text in interior:
+            tokens.append(text)
+            if "." in text:
+                tokens.append(text.rsplit(".", 1)[-1])
+        return tokens
+    if rec.answer_type == "list":
+        tokens = []
         for item in rec.answer or []:
             text = str(item)
             tokens.append(text)
@@ -99,15 +113,58 @@ def _answer_tokens(rec: QuestionRecord) -> list[str]:
     return tokens
 
 
+def _template_mentions(template: str, token: str) -> bool:
+    """Is `token` already information the template gave away?
+
+    A bare short name counts as present when the template names the same entity
+    in qualified form: `refresh_from_db` tells the reader nothing new when the
+    template already said `django.db.models.base.Model.refresh_from_db`. Without
+    this, a rewrite that legitimately shortens an unambiguous name -- which the
+    persona instructions explicitly allow -- reads as a leak.
+    """
+    return _mentions(template, token)
+
+
+def _identifier_like(token: str) -> bool:
+    """Would this token be mistaken for an ordinary English word?
+
+    `refresh_from_db` and `FileBasedCache` could only be code. `set`, `get`,
+    and `name` are also verbs and nouns, so a bare occurrence proves nothing --
+    those are only counted when they appear in an unambiguously code context.
+
+    Numeric answers are always matched bare: a count question whose rewrite
+    contains the count has leaked it, however it is punctuated.
+    """
+    if token.isdigit():
+        return True
+    return "_" in token or any(c.isupper() for c in token[1:])
+
+
+def _mentions(text: str, token: str) -> bool:
+    """Does `text` refer to the entity `token` names, in any form?
+
+    Matches the qualified name, and a short name written either bare (when the
+    short name could not be prose) or in code context -- backticked, dotted
+    onto a parent, or followed by a call's parentheses.
+    """
+    whole = rf"(?<![\w]){re.escape(token)}(?![\w])"
+    if "." in token or _identifier_like(token):
+        return bool(re.search(whole, text))
+    escaped = re.escape(token)
+    return bool(re.search(rf"`{escaped}`|\.{escaped}(?![\w])|{escaped}\s*\(", text))
+
+
 def check_answer_leak(rec: QuestionRecord, rewrite: str) -> list[str]:
     template = rec.question
     problems = []
     for token in _answer_tokens(rec):
         if not token:
             continue
-        pattern = re.compile(rf"(?<![\w.]){re.escape(token)}(?![\w])")
-        if pattern.search(rewrite) and not pattern.search(template):
-            problems.append(f"leaks answer token {token!r} that the template did not contain")
+        if not _mentions(rewrite, token):
+            continue
+        if _template_mentions(template, token):
+            continue
+        problems.append(f"leaks answer token {token!r} that the template did not contain")
     return problems
 
 
