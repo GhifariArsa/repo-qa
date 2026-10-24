@@ -11,7 +11,7 @@ from __future__ import annotations
 import random
 
 from .base import make_question, template
-from ._util import callables, pick
+from ._util import callables, pick, rebalance, split_quota
 
 #: Hop-length buckets for tier 2. Sampling is stratified across these rather
 #: than drawn from one pool, for two reasons.
@@ -29,10 +29,13 @@ from ._util import callables, pick
 #: expanding outward from each, then filling buckets. Anchors are drawn with
 #: the seeded RNG, so generation stays reproducible (Cypher's `rand()` would
 #: not be).
+#: Starts at three hops. A two-hop chain is one grep and one read: the pilot's
+#: agent solved those almost every time, and difficulty only separated models
+#: once a question forced a search across several files.
 HOP_BUCKETS: tuple[tuple[str, int, int], ...] = (
-    ("2", 2, 2),
     ("3", 3, 3),
-    ("4+", 4, 12),
+    ("4-5", 4, 5),
+    ("6+", 6, 12),
 )
 
 #: How many source anchors to expand before giving up on filling every bucket.
@@ -187,13 +190,23 @@ def _shortest(client, repo_id, source, target):
 
 @template("t2_path_exists", 2)
 def t2_path_exists(client, repo_id, limit, rng: random.Random):
-    rows = sample_paths_stratified(client, repo_id, limit, rng)
+    """Half reachable pairs (stratified by hop count), half unreachable ones.
+
+    The reachable side alone made the answer always "yes" -- and the identical
+    question in `t4_no_call_path` always "no" -- so the wording gave it away.
+    """
+    from .tier4_negative import sample_unreachable_pairs_tagged
+
+    n_yes, n_no = split_quota(limit, rng)
+    rows = sample_paths_stratified(client, repo_id, n_yes, rng)
+    rows += [{"source": s, "target": t, "polarity": kind}
+             for s, t, kind in sample_unreachable_pairs_tagged(client, repo_id, n_no, rng)]
     out = []
     for i, row in enumerate(rows):
         reachable = client.run(
             _GT_PATH_EXISTS, repo=repo_id, source=row["source"], target=row["target"]
         )[0]["reachable"]
-        chain, hops = _shortest(client, repo_id, row["source"], row["target"])
+        chain, hops = _shortest(client, repo_id, row["source"], row["target"]) if reachable else (None, None)
         out.append(make_question(
             tier=2, template_id="t2_path_exists", repo_id=repo_id, index=i,
             question=(
@@ -203,9 +216,10 @@ def t2_path_exists(client, repo_id, limit, rng: random.Random):
             answer=bool(reachable), answer_type="bool",
             cypher=_GT_PATH_EXISTS,
             params={"repo": repo_id, "source": row["source"], "target": row["target"]},
-            evidence={"chain": chain, "hops": hops, "hop_bucket": _bucket_for(hops)},
+            evidence={"chain": chain, "hops": hops,
+                      "hop_bucket": _bucket_for(hops) if hops else row.get("polarity", "unreachable")},
         ))
-    return out
+    return rebalance(out)
 
 
 @template("t2_shortest_chain", 2)
@@ -347,12 +361,56 @@ RETURN count(DISTINCT f) > 0 AS reaches, collect(DISTINCT f.qname) AS readers
 """
 
 
+def _global_read_question(client, repo_id, index, src, glob, polarity):
+    res = client.run(_GT_CALLERS_READING_GLOBAL, repo=repo_id, source=src, **{"global": glob})
+    reaches = bool(res and res[0]["reaches"])
+    return make_question(
+        tier=2, template_id="t2_reaches_global_read", repo_id=repo_id, index=index,
+        question=(
+            f"Starting from `{src}` and following calls, is the global variable "
+            f"`{glob}` read anywhere along the way (including in `{src}` itself)?"
+        ),
+        answer=reaches, answer_type="bool",
+        cypher=_GT_CALLERS_READING_GLOBAL,
+        params={"repo": repo_id, "source": src, "global": glob},
+        evidence={"readers": sorted(res[0]["readers"]) if reaches else [], "polarity": polarity},
+    )
+
+
 @template("t2_reaches_global_read", 2)
 def t2_reaches_global_read(client, repo_id, limit, rng: random.Random):
-    """Does a call starting here end up reading a particular global?"""
+    """Does a call starting here end up reading a particular global?
+
+    Half yes, built backwards from a real reader; half no, drawn from callables
+    in the global's own module, so "they live in the same file" is no tell.
+    """
     readers = client.run(_SAMPLE_GLOBAL_READERS, repo=repo_id)
     if not readers:
         return []
+    n_yes, n_no = split_quota(limit, rng)
+    out = _global_read_positives(client, repo_id, readers, n_yes, rng)
+    names = [c["qname"] for c in callables(client, repo_id)]
+    added, seen = 0, set()
+    candidates = pick(rng, readers, max(n_no * 10, 50))
+    for attempt, row in enumerate(candidates * 2):
+        if added >= n_no:
+            break
+        module = row["global"].rsplit(".", 1)[0]
+        # Same-module near misses first; once those run dry, any callable.
+        near = [q for q in names if q.startswith(module + ".")] if attempt < len(candidates) else []
+        near = near or names
+        src = rng.choice(near)
+        if (src, row["global"]) in seen:
+            continue
+        seen.add((src, row["global"]))
+        rec = _global_read_question(client, repo_id, len(out), src, row["global"], "same_module_non_reader")
+        if rec.answer is False:
+            out.append(rec)
+            added += 1
+    return rebalance(out)
+
+
+def _global_read_positives(client, repo_id, readers, limit, rng: random.Random):
     out = []
     for row in pick(rng, readers, max(limit * 4, 20)):
         if len(out) >= limit:
@@ -362,19 +420,7 @@ def t2_reaches_global_read(client, repo_id, limit, rng: random.Random):
         if not callers:
             continue
         src = rng.choice(callers)
-        res = client.run(_GT_CALLERS_READING_GLOBAL, repo=repo_id,
-                         source=src, **{"global": row["global"]})
-        if not res or not res[0]["reaches"]:
-            continue                      # negatives belong to tier 4
-        out.append(make_question(
-            tier=2, template_id="t2_reaches_global_read", repo_id=repo_id, index=len(out),
-            question=(
-                f"Starting from `{src}` and following calls, is the global variable "
-                f"`{row['global']}` read anywhere along the way (including in `{src}` itself)?"
-            ),
-            answer=True, answer_type="bool",
-            cypher=_GT_CALLERS_READING_GLOBAL,
-            params={"repo": repo_id, "source": src, "global": row["global"]},
-            evidence={"readers": sorted(res[0]["readers"])},
-        ))
+        rec = _global_read_question(client, repo_id, len(out), src, row["global"], "reaches_reader")
+        if rec.answer is True:
+            out.append(rec)
     return out

@@ -22,14 +22,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def run_review(path: Path, tier: int | None, sample: int, seed: int, status: str) -> None:
+def run_review(path: Path, family: str | None, sample: int, seed: int, status: str) -> None:
     records = read_questions(path)
     pool = [
         r for r in records
-        if (tier is None or r.tier == tier) and r.verification.get("status") == status
+        if (family is None or r.family == family) and r.verification.get("status") == status
     ]
     if not pool:
-        print(f"nothing to review (tier={tier}, status={status})")
+        print(f"nothing to review (family={family}, status={status})")
         return
 
     rng = random.Random(seed)
@@ -43,7 +43,8 @@ def run_review(path: Path, tier: int | None, sample: int, seed: int, status: str
     for n, rec in enumerate(chosen, 1):
         print("=" * 78)
         print(f"[{n}/{len(chosen)}]  {rec.id}")
-        print(f"tier {rec.tier} ({rec.tier_name})   template {rec.template_id}")
+        print(f"family {rec.family}   template {rec.template_id}")
+        print(f"operations: {', '.join(rec.operations)}   outcome: {rec.outcome}")
         print(f"\nQ: {rec.question}")
         print(f"\nA: {rec.answer_text}")
         if rec.evidence:
@@ -76,19 +77,19 @@ def run_review(path: Path, tier: int | None, sample: int, seed: int, status: str
 
 def report(path: Path) -> None:
     records = read_questions(path)
-    per_tier: dict[int, Counter] = defaultdict(Counter)
+    per_family: dict[str, Counter] = defaultdict(Counter)
     for rec in records:
-        per_tier[rec.tier][rec.verification.get("status", "pending")] += 1
+        per_family[rec.family][rec.verification.get("status", "pending")] += 1
 
     print(f"{path}  ({len(records)} questions)\n")
-    header = f"{'tier':<6}{'total':>7}{'verified':>10}{'rejected':>10}{'pending':>9}"
+    header = f"{'family':<32}{'total':>7}{'verified':>10}{'rejected':>10}{'pending':>9}"
     print(header)
     print("-" * len(header))
-    for tier in sorted(per_tier):
-        counts = per_tier[tier]
+    for family in sorted(per_family):
+        counts = per_family[family]
         total = sum(counts.values())
         print(
-            f"{tier:<6}{total:>7}{counts['verified']:>10}"
+            f"{family:<32}{total:>7}{counts['verified']:>10}"
             f"{counts['rejected']:>10}{counts['pending']:>9}"
         )
 

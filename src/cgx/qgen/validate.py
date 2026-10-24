@@ -51,6 +51,9 @@ class RepoVocabulary:
             or token in self.file_paths
             or token in self.short_name_counts
             or any(q.endswith("." + token) for q in self.qnames)
+            # "the `_cmd_run` in `evals_cli.py`": a trailing part of a real path.
+            or ("/" in token or token.endswith(".py"))
+            and any(p.endswith("/" + token) for p in self.file_paths)
         )
 
 

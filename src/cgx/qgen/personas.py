@@ -66,17 +66,15 @@ PERSONAS: dict[str, Persona] = {
     ),
 }
 
-#: Personas that suit each tier's question shape. Tier 4's negatives read most
-#: naturally as a reviewer verifying a claim or a newcomer checking an assumption
-#: -- which is also how a wrong belief about a codebase actually surfaces.
-TIER_PERSONAS: dict[int, tuple[str, ...]] = {
-    1: ("plain", "newcomer", "reviewer"),
-    2: ("debugger", "refactorer", "plain"),
-    3: ("refactorer", "reviewer", "plain"),
-    4: ("reviewer", "newcomer", "debugger"),
-    5: ("debugger", "refactorer"),
+#: Personas follow the subject family, independently of answer polarity.
+FAMILY_PERSONAS: dict[str, tuple[str, ...]] = {
+    "definition_organisation": ("plain", "newcomer", "reviewer"),
+    "dependency_interaction": ("debugger", "refactorer", "plain"),
+    "inheritance_specialisation": ("newcomer", "reviewer", "plain"),
+    "state_access": ("debugger", "refactorer", "plain"),
+    "structural_comparison": ("refactorer", "reviewer", "plain"),
 }
 
 
-def personas_for_tier(tier: int) -> tuple[Persona, ...]:
-    return tuple(PERSONAS[p] for p in TIER_PERSONAS.get(tier, ("plain",)))
+def personas_for_family(family: str) -> tuple[Persona, ...]:
+    return tuple(PERSONAS[p] for p in FAMILY_PERSONAS.get(family, ("plain",)))

@@ -6,8 +6,7 @@ produced by an agent exploring the repo, it is read off the graph, so it is
 reproducible and auditable. Keep `cypher` + `params` populated -- a question
 without them cannot be re-verified when the repo or extractor changes.
 
-Tier labels are carried per record and must not be flattened away: reporting is
-per-tier accuracy, not one aggregate number.
+Subject families and operations are independent; neither implies difficulty.
 """
 
 from __future__ import annotations
@@ -17,20 +16,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-TIER_NAMES = {
-    1: "existence_lookup",
-    2: "path_traversal",
-    3: "aggregation",
-    4: "counterfactual_negative",
-    5: "cross_graph_composition",
-}
-
+from .taxonomy import TAXONOMY_VERSION, answer_outcome, template_spec
 
 @dataclass
 class QuestionRecord:
     id: str
-    tier: int
-    tier_name: str
     template_id: str
     repo_id: str
     question: str                   # the phrasing an evaluated model sees
@@ -50,6 +40,19 @@ class QuestionRecord:
     #: Provenance of the rewrite: model, prompt version, persona, and every
     #: candidate a validator or the judge rejected.
     naturalization: dict[str, Any] = field(default_factory=dict)
+    family: str = ""
+    operations: list[str] = field(default_factory=list)
+    relations: list[str] = field(default_factory=list)
+    outcome: str = ""
+    taxonomy_version: int = TAXONOMY_VERSION
+    legacy_taxonomy: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        spec = template_spec(self.template_id)
+        self.family = spec.family
+        self.operations = list(spec.operations)
+        self.relations = list(spec.relations)
+        self.outcome = answer_outcome(self.answer, self.answer_type)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -57,7 +60,7 @@ class QuestionRecord:
 
 def make_question(
     *,
-    tier: int,
+    tier: int | None = None,
     template_id: str,
     repo_id: str,
     index: int,
@@ -69,10 +72,15 @@ def make_question(
     evidence: dict | None = None,
     answer_text: str | None = None,
 ) -> QuestionRecord:
+    # Existing templates retain their IDs and seeds. The optional tier argument
+    # supports old callers only; family assignment always comes from the spec.
+    prefix = template_id.split("_", 1)[0]
+    legacy = int(prefix[1:]) if prefix in {"t1", "t2", "t3", "t4", "t5"} else None
+    if tier is not None and tier != legacy:
+        raise ValueError("legacy tier does not match the template identifier")
+    identity = f"t{legacy}" if legacy else template_spec(template_id).family
     return QuestionRecord(
-        id=f"{repo_id}::t{tier}::{template_id}::{index:04d}",
-        tier=tier,
-        tier_name=TIER_NAMES[tier],
+        id=f"{repo_id}::{identity}::{template_id}::{index:04d}",
         template_id=template_id,
         repo_id=repo_id,
         question=question,
@@ -101,24 +109,24 @@ def render_answer(answer: Any, answer_type: str) -> str:
 # Registry
 # --------------------------------------------------------------------------
 
-#: template_id -> (tier, generator callable)
+#: template_id -> (family, generator callable)
 Generator = Callable[..., list[QuestionRecord]]
-_REGISTRY: dict[str, tuple[int, Generator]] = {}
+_REGISTRY: dict[str, tuple[str, Generator]] = {}
 
 
-def template(template_id: str, tier: int) -> Callable[[Generator], Generator]:
+def template(template_id: str, tier: int | None = None) -> Callable[[Generator], Generator]:
     def wrap(fn: Generator) -> Generator:
-        _REGISTRY[template_id] = (tier, fn)
+        _REGISTRY[template_id] = (template_spec(template_id).family, fn)
         return fn
     return wrap
 
 
-def registry() -> dict[str, tuple[int, Generator]]:
+def registry() -> dict[str, tuple[str, Generator]]:
     return dict(_REGISTRY)
 
 
-def templates_for_tier(tier: int) -> dict[str, Generator]:
-    return {tid: fn for tid, (t, fn) in _REGISTRY.items() if t == tier}
+def templates_for_family(family: str) -> dict[str, Generator]:
+    return {tid: fn for tid, (f, fn) in _REGISTRY.items() if f == family}
 
 
 # --------------------------------------------------------------------------
@@ -140,5 +148,13 @@ def read_questions(path: Path) -> list[QuestionRecord]:
         for line in fh:
             line = line.strip()
             if line:
-                records.append(QuestionRecord(**json.loads(line)))
+                data = json.loads(line)
+                version = data.get("taxonomy_version", 1)
+                if version not in (1, TAXONOMY_VERSION):
+                    raise ValueError(f"unsupported taxonomy version {version}")
+                legacy = {key: data.pop(key) for key in ("tier", "tier_name") if key in data}
+                if legacy:
+                    data["legacy_taxonomy"] = {**data.get("legacy_taxonomy", {}), **legacy}
+                data["taxonomy_version"] = TAXONOMY_VERSION
+                records.append(QuestionRecord(**data))
     return records

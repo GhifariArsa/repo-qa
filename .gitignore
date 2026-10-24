@@ -7,3 +7,16 @@ build/
 data/
 *.egg-info/
 .pytest_cache/
+
+# Cloned real repos used as extraction targets (not fixtures we author)
+fixtures/django/
+fixtures/odysseus/
+fixtures/reef/
+fixtures/artemis/
+fixtures/xy/
+fixtures/openworker/
+fixtures/axisagentic/
+fixtures/rpent/
+fixtures/printfilm/
+fixtures/laya/
+fixtures/edge0/

@@ -130,6 +130,13 @@ class Node:
     end_line: int | None = None
     class_qname: str | None = None  # METHOD and FIELD only, per the paper
     module_qname: str | None = None
+    #: FUNCTION and METHOD only (our addition): call sites static resolution
+    #: may have missed -- see extract/completeness.py. `*_any` also counts
+    #: names shared with ubiquitous builtin methods (`get`, `append`, ...).
+    unresolved_out: int | None = None
+    unresolved_out_any: int | None = None
+    unresolved_in: int | None = None
+    unresolved_in_any: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}

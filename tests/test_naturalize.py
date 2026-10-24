@@ -11,16 +11,6 @@ REPO = "minirepo"
 
 
 @pytest.fixture(scope="module")
-def loaded(neo4j_client, minigraph):
-    from cgx.graph.ingest import ingest
-
-    graph, _ = minigraph
-    neo4j_client.apply_schema()
-    ingest(neo4j_client, graph.to_dict(), replace=True)
-    return neo4j_client
-
-
-@pytest.fixture(scope="module")
 def vocab(loaded):
     from cgx.qgen.validate import load_vocabulary
 

@@ -8,8 +8,133 @@ neo4j:
 repos:
   - id: minirepo
     path: fixtures/minirepo
-    package_root: fixtures        # dir that the top-level package sits inside
+    package_root: fixtures # dir that the top-level package sits inside
     # contamination metadata (Phase 4 populates these for real repos)
     created_at: null
     last_commit_at: null
     source: fixture
+  - id: django
+    # Repo root contains the `django/` package, so the repo root is the package
+    # root. `fixtures` here named every module `django.django.*`.
+    path: fixtures/django
+    package_root: fixtures/django
+    # contamination metadata (Phase 4 populates these for real repos)
+    created_at: null
+    last_commit_at: null
+    source: fixture
+  - id: odysseus
+    # Flat application, not an installable package: imports are `from src.`,
+    # `from core.`, `from routes.`, so the repo root IS the package root.
+    # Pointing package_root one level up would prefix every module with
+    # `odysseus.` and misname every referent in every question.
+    path: fixtures/odysseus
+    package_root: fixtures/odysseus
+    created_at: 2026-05-31
+    last_commit_at: 2026-09-13
+    source: github
+    url: https://github.com/odysseus-dev/odysseus
+    license: AGPL-3.0
+    stars: 87199
+
+  # --- Post-cutoff set (created >= 2026-07-01), selected 2026-09-26 ---
+  # Filters: >=3k non-test Python LOC, >=25 classes, OSI licence, <~15% vendored
+  # pre-cutoff code (FreeToken, LongHorizon-Harness dropped for vendoring).
+  - id: reef
+    # large; agent infra
+    path: fixtures/reef
+    package_root: fixtures/reef
+    commit: ecec4e20b29e7dcbd96150d4b4f1a80b146e120d
+    created_at: 2026-08-31
+    last_commit_at: 2026-09-25
+    source: github
+    url: https://github.com/Human-Agent-Society/reef
+    license: Apache-2.0
+    stars: 5653
+  - id: artemis
+    # large; Android agent
+    path: fixtures/artemis
+    package_root: fixtures/artemis
+    commit: 371aa6df56880643da57b30da936e9812fb0ec66
+    created_at: 2026-08-13
+    last_commit_at: 2026-09-12
+    source: github
+    url: https://github.com/google/artemis
+    license: Apache-2.0
+    stars: 10139
+  - id: xy
+    # large; charting library
+    path: fixtures/xy
+    package_root: fixtures/xy/python
+    commit: 72a069f1196a348e8c242c9fcfffdf800cb2fec2
+    created_at: 2026-07-09
+    last_commit_at: 2026-09-22
+    source: github
+    url: https://github.com/reflex-dev/xy
+    license: Apache-2.0
+    stars: 1857
+  - id: openworker
+    # medium; relative imports inside coworker/
+    path: fixtures/openworker
+    package_root: fixtures/openworker
+    commit: 5870585321e2cae0b2afbcd8903e14b63c959ac7
+    created_at: 2026-07-20
+    last_commit_at: 2026-09-24
+    source: github
+    url: https://github.com/andrewyng/openworker
+    license: MIT
+    stars: 18283
+  - id: axisagentic
+    # medium; agent runtime
+    path: fixtures/axisagentic
+    package_root: fixtures/axisagentic
+    commit: 0aa54b14307942edc4401831110d8e7f726ec738
+    created_at: 2026-07-23
+    last_commit_at: 2026-07-24
+    source: github
+    url: https://github.com/XYZ-AI-Lab/AxisAgentic
+    license: Apache-2.0
+    stars: 1119
+  - id: rpent
+    # medium; robotics
+    path: fixtures/rpent
+    package_root: fixtures/rpent
+    commit: 19d40799842b1f87533c71e836d20546c53ad7b1
+    created_at: 2026-07-07
+    last_commit_at: 2026-09-26
+    source: github
+    url: https://github.com/RLinf/RPent
+    license: Apache-2.0
+    stars: 1103
+  - id: printfilm
+    # medium; FastAPI web backend
+    path: fixtures/printfilm
+    package_root: fixtures/printfilm/backend
+    commit: cdcd1f73d6671544b13716ca8d0c5ef1d76e11e7
+    created_at: 2026-09-10
+    last_commit_at: 2026-09-24
+    source: github
+    url: https://github.com/yi1108/printfilm
+    license: MIT
+    stars: 3031
+  - id: laya
+    # small; decision engine
+    path: fixtures/laya
+    package_root: fixtures/laya
+    commit: 4066d5d5fbf08b66c6757ddeedbd797bd7655bc0
+    created_at: 2026-09-18
+    last_commit_at: 2026-09-25
+    source: github
+    url: https://github.com/NandhaKishorM/laya
+    license: Apache-2.0
+    stars: 25269
+  - id: edge0
+    # small; src layout
+    path: fixtures/edge0
+    package_root: fixtures/edge0/src
+    commit: fb4cd2c49ebe22bb230e1451ecb8fb4957ca62e6
+    created_at: 2026-09-08
+    last_commit_at: 2026-09-20
+    source: github
+    url: https://github.com/Edge0-AI/Edge0
+    license: Apache-2.0
+    stars: 2097

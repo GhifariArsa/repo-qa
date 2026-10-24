@@ -76,18 +76,36 @@ def generate(
     config: Path = typer.Option(Path("config/repos.yaml"), "--config"),
     per_template: int = typer.Option(5, "--per-template", "-n"),
     seed: int = typer.Option(0, "--seed"),
-    include_tier5: bool = typer.Option(False, "--include-tier5"),
+    family: list[str] = typer.Option(None, "--family", help="family slug; repeat to select several (default: all five)"),
+    per_family: int = typer.Option(None, "--per-family", min=1, help="budget per family, overriding --per-template"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="explicitly replace an existing question dataset"),
+    include_trivial: bool = typer.Option(False, "--include-trivial",
+                                         help="also generate templates whose answer is on the question's face"),
+    completeness: str = typer.Option("default", "--completeness",
+                                     help="default | strict | off: drop questions over possibly incomplete call graph"),
+    hard_share: float = typer.Option(0.8, "--hard-share", min=0.0, max=1.0,
+                                     help="share of each --per-family budget given to repo-wide/transitive templates"),
     out: Path = typer.Option(None, "--out"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
     quiet: bool = typer.Option(False, "--quiet", "-q"),
 ):
-    """Generate tier-labelled Q&A pairs from the graph."""
+    """Generate questions classified by subject family and operations."""
     setup_logging(verbose=verbose, quiet=quiet)
+    from .qgen.taxonomy import DEFAULT_FAMILIES, validate_families
+
+    path = out or _questions_path(repo)
+    if path.exists() and not overwrite:
+        raise typer.BadParameter(f"{path} exists; choose --out or explicitly use --overwrite")
+    try:
+        families = validate_families(family or DEFAULT_FAMILIES)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     cfg = load_config(config)
-    tiers = (1, 2, 3, 4, 5) if include_tier5 else (1, 2, 3, 4)
     with graph_client(cfg.neo4j) as c:
-        records, stats = generate_questions(c, repo, tiers, per_template, seed)
-    path = write_questions(records, out or _questions_path(repo))
+        records, stats = generate_questions(c, repo, families, per_template, seed, per_family,
+                                            include_trivial=include_trivial, completeness=completeness,
+                                            hard_share=hard_share)
+    path = write_questions(records, path)
     typer.echo(json.dumps(stats, indent=2))
     typer.echo(f"\nwrote {len(records)} questions to {path}")
 
@@ -111,7 +129,7 @@ def naturalize(
         NaturalizationConfig, Naturalizer, build_rewrite_prompt, collect_batch,
         load_vocabulary, submit_batch,
     )
-    from .qgen.personas import personas_for_tier
+    from .qgen.personas import personas_for_family
 
     cfg = load_config(config)
     qpath = questions or _questions_path(repo)
@@ -125,9 +143,9 @@ def naturalize(
 
     if dry_run:
         for rec in records:
-            ps = personas_for_tier(rec.tier)[:personas]
+            ps = personas_for_family(rec.family)[:personas]
             typer.echo("=" * 78)
-            typer.echo(f"{rec.id}   (tier {rec.tier}, personas: {', '.join(p.id for p in ps)})")
+            typer.echo(f"{rec.id}   (family {rec.family}, personas: {', '.join(p.id for p in ps)})")
             typer.echo(build_rewrite_prompt(rec, vocab, ps))
         typer.echo(f"\n{len(records)} prompt(s) shown. No API calls made.")
         return
@@ -192,7 +210,7 @@ def _naturalization_summary(records) -> None:
 @app.command()
 def verify(
     repo: str = typer.Argument(...),
-    tier: int = typer.Option(None, "--tier", help="restrict to one tier"),
+    family: str = typer.Option(None, "--family", help="restrict to one subject family"),
     sample: int = typer.Option(10, "--sample", "-n"),
     seed: int = typer.Option(0, "--seed"),
     status: str = typer.Option("pending", "--status", help="which records to review"),
@@ -201,7 +219,13 @@ def verify(
     """Review sampled questions and mark them verified or rejected."""
     from .verify.cli import run_review
 
-    run_review(questions or _questions_path(repo), tier, sample, seed, status)
+    from .qgen.taxonomy import validate_families
+    try:
+        if family is not None:
+            validate_families([family])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    run_review(questions or _questions_path(repo), family, sample, seed, status)
 
 
 @app.command("verify-report")
@@ -209,7 +233,7 @@ def verify_report(
     repo: str = typer.Argument(...),
     questions: Path = typer.Option(None, "--questions"),
 ):
-    """Show verification coverage per tier."""
+    """Show verification coverage per subject family."""
     from .verify.cli import report
 
     report(questions or _questions_path(repo))
@@ -258,7 +282,7 @@ def evaluate(
     model: str = typer.Option("stub", "--model"),
     limit: int = typer.Option(None, "--limit"),
 ):
-    """Score a model's answers per tier (Phase 5; `stub` runs the scorer only)."""
+    """Score answers by family, operation and outcome; stub/oracle are sanity checks."""
     from .eval.harness import run_evaluation
 
     run_evaluation(
@@ -267,6 +291,111 @@ def evaluate(
         model=model,
         limit=limit,
     )
+
+
+@app.command("agent-eval")
+def agent_eval(
+    repo: str = typer.Argument(...),
+    model: str = typer.Option(..., "--model", help="openrouter:<vendor>/<model>, e.g. openrouter:anthropic/claude-opus-5"),
+    condition: str = typer.Option("repo", "--condition", help="repo (read-only tools) or closed (no repository access)"),
+    phrasing: str = typer.Option("natural", "--phrasing",
+                                 help="natural (the published arm; needs naturalisation) or template"),
+    per_family: int = typer.Option(None, "--per-family", min=1, help="seeded sample of N questions per family"),
+    limit: int = typer.Option(None, "--limit", min=1),
+    seed: int = typer.Option(0, "--seed"),
+    concurrency: int = typer.Option(4, "--concurrency", "-j", min=1),
+    max_cost: float = typer.Option(None, "--max-cost", help="stop starting new questions once spend reaches this many USD"),
+    config: Path = typer.Option(Path("config/repos.yaml"), "--config"),
+    questions: Path = typer.Option(None, "--questions"),
+    out_dir: Path = typer.Option(DATA / "eval" / "runs", "--out-dir"),
+):
+    """Run a model through the read-only agent harness and score it."""
+    from .eval.harness import run_agent_evaluation
+
+    rc = load_config(config).repo(repo)
+    run_agent_evaluation(
+        repo_id=repo, repo_path=rc.path, package_root=rc.package_root,
+        questions_path=questions or _questions_path(repo), graph_path=_graph_path(repo),
+        model=model, condition=condition, phrasing=phrasing, per_family=per_family,
+        limit=limit, seed=seed, concurrency=concurrency, max_cost=max_cost, out_dir=out_dir,
+    )
+
+
+@app.command("naturalize-agent")
+def naturalize_agent(
+    repo: str = typer.Argument(...),
+    writer: str = typer.Option("openrouter:google/gemini-3.8-flash", "--writer"),
+    resolver: str = typer.Option("openrouter:qwen/qwen3.7-flash", "--resolver"),
+    judge: str = typer.Option("openrouter:anthropic/claude-sonnet-5", "--judge"),
+    per_family: int = typer.Option(2, "--per-family", min=1, help="pilot sample size per family"),
+    all_questions: bool = typer.Option(False, "--all", help="rewrite every question, ignoring --per-family"),
+    sampling: str = typer.Option("round_robin", "--sampling", help="round_robin | proportional"),
+    seed: int = typer.Option(0, "--seed"),
+    concurrency: int = typer.Option(4, "--concurrency", "-j", min=1),
+    config: Path = typer.Option(Path("config/repos.yaml"), "--config"),
+    questions: Path = typer.Option(None, "--questions", help="default: data/questions/<repo>.jsonl"),
+    out: Path = typer.Option(None, "--out", help="default: data/naturalize_pilot/<repo>.jsonl"),
+):
+    """Run the agentic naturaliser on a stratified sample, or on --all. Never edits its input."""
+    import random
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .eval.harness import select_questions
+    from .qgen.agentic_naturalize import AgenticConfig, AgenticNaturalizer
+    from .qgen.providers import client_for, parse_model_spec
+    from .qgen.validate import load_vocabulary
+
+    providers = {parse_model_spec(spec)[0] for spec in (writer, resolver, judge)}
+    if len(providers) != 1 or not providers <= {"openrouter", "ollama"}:
+        raise typer.BadParameter("writer, resolver and judge must all be openrouter:... or all be ollama:...")
+    cfg = load_config(config)
+    rc = cfg.repo(repo)
+    records = select_questions(read_questions(questions or _questions_path(repo)),
+                               None if all_questions else per_family, seed, sampling)
+    with graph_client(cfg.neo4j) as c:
+        vocab = load_vocabulary(c, repo)
+    root = rc.package_root.resolve()
+    pkg = str(root.relative_to(rc.path.resolve())) if root.is_relative_to(rc.path.resolve()) else "."
+    conf = AgenticConfig(writer=parse_model_spec(writer)[1], resolver=parse_model_spec(resolver)[1],
+                         judge=parse_model_spec(judge)[1])
+    client = client_for(providers.pop())
+
+    def one(i_rec):
+        i, rec = i_rec
+        nat = AgenticNaturalizer(client, conf, rc.path, pkg, vocab, random.Random(f"{seed}:{rec.id}"))
+        return nat.naturalize(rec)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        outcomes = list(pool.map(one, enumerate(records)))
+
+    path = out or DATA / "naturalize_pilot" / f"{repo}.jsonl"
+    write_questions([o.rec for o in outcomes], path)
+    accepted = sum(o.accepted for o in outcomes)
+    for o in outcomes:
+        n = o.rec.naturalization
+        typer.echo(f"\n[{n['status']}] {o.rec.template_id}  (${o.cost_usd:.4f})")
+        typer.echo(f"  T: {o.rec.question_template}")
+        if o.accepted:
+            typer.echo(f"  N: {o.rec.question}")
+        for a in n["attempts"]:
+            if a.get("rejected_by"):
+                typer.echo(f"  x {a['rejected_by']}: {'; '.join(map(str, a.get('problems') or []))[:220]}"
+                           + (f"  <- {a['question'][:160]}" if a.get("question") else ""))
+    typer.echo(f"\n{repo}: accepted {accepted}/{len(outcomes)}, cost ${sum(o.cost_usd for o in outcomes):.3f}"
+               f"  -> {path}")
+
+
+@app.command("migrate-taxonomy")
+def migrate_taxonomy(
+    questions: Path = typer.Argument(..., exists=True, dir_okay=False),
+    out: Path = typer.Option(..., "--out", help="new JSONL path; source remains unchanged"),
+):
+    """Reclassify old records without regenerating answers or losing review state."""
+    if out.exists() or questions.resolve() == out.resolve():
+        raise typer.BadParameter("--out must be a new file; migration never overwrites datasets")
+    records = read_questions(questions)
+    write_questions(records, out)
+    typer.echo(f"migrated {len(records)} records to taxonomy v2 -> {out}")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from ..schema import (
     validate_graph,
 )
 from .ast_pass import run_ast_pass
+from .completeness import annotate as annotate_completeness
 from .pyan_pass import run_pyan_pass
 
 log = get_logger(__name__)
@@ -82,6 +83,17 @@ def extract_repo(
     log.info("extracting %r from %s", repo_id, repo_path)
 
     py_files = discover_python_files(repo_path, include_tests=include_tests)
+    # A package root inside the repo (`src/`, `python/`, `backend/`) scopes what
+    # gets extracted: module names are computed relative to it, so a file
+    # outside it -- `scripts/`, `benchmarks/` -- has no module name at all.
+    # `repo_path` stays the repo root so every `file_path` answer is still
+    # relative to the repository root, which is what the questions promise.
+    if package_root != repo_path and package_root.is_relative_to(repo_path):
+        in_scope = [p for p in py_files if p.resolve().is_relative_to(package_root)]
+        if len(in_scope) < len(py_files):
+            log.info("skipped %d file(s) outside package root %s",
+                     len(py_files) - len(in_scope), package_root.relative_to(repo_path))
+        py_files = in_scope
     if not py_files:
         raise SystemExit(f"no Python files found under {repo_path}")
     log.info("discovered %d Python file(s) (package root: %s)", len(py_files), package_root)
@@ -122,6 +134,11 @@ def extract_repo(
     edges += ast_result.edges
     edges += pyan_result.edges
 
+    completeness = annotate_completeness(nodes, edges, ast_result.call_sites)
+    log.info("completeness: %d of %d callable(s) may be missing outgoing calls, %d incoming",
+             completeness["callables_incomplete_out"], completeness["callables"],
+             completeness["callables_incomplete_in"])
+
     graph = CodeGraph(repo_id=repo_id, nodes=nodes, edges=edges)
     log.info("validating %d node(s) and %d edge(s) against the schema",
              len(nodes), len(edges))
@@ -137,6 +154,7 @@ def extract_repo(
         "nodes_by_label": _count(n.label for n in nodes),
         "edges_by_type": _count(e.type for e in edges),
         **pyan_result.stats,
+        "completeness": completeness,
     }
     return graph, {"stats": stats, "rejected_calls": pyan_result.rejected_calls}
 

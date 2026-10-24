@@ -7,7 +7,7 @@ with the Cypher query that produced its answer, so the label is reproducible
 and auditable rather than adjudicated.
 
 Pipeline: `pyan3 static analysis -> CodexGraph-schema graph (+ CALLS) -> Neo4j
--> tiered question generator -> optional LLM rephrasing`.
+-> family-classified question generator -> optional LLM rephrasing`.
 
 ## Schema
 
@@ -35,7 +35,7 @@ with two deliberate additions, both marked below.
 
 `CALLS` is the substantive extension. CodexGraph's own authors flag its absence:
 _"adding edges related to function calls will enhance the broader applicability
-of CodexGraph."_ Tiers 2, 3 and 5 are largely unaskable without it.
+of CodexGraph."_ Call traversal, dependency aggregation and state-access composition depend on it.
 
 Following the paper, `code_ref` stores a **pointer** into the source
 (`path:start-end`), not the snippet text.
@@ -121,34 +121,51 @@ lines per statement instead: 16 statements declared, 16 applied.
 **Edge identity vs edge payload.** `MERGE (s)-[r:USES]->(t)` keeps one
 relationship per pair, so a method that both reads _and_ writes the same field
 collapsed to one edge with `access` overwritten by whichever arrived last — on
-Django, 510 edges, silently corrupting the read/write distinction that tier 5
+Django, 510 edges, silently corrupting the read/write distinction that state access
 filters on. `EDGE_IDENTITY_ATTRS` in `schema.py` declares which attributes are
 part of an edge's identity, and those go into the MERGE pattern.
 
 Nodes carry two labels: their schema label and a shared `:CodeNode`, so
 traversals that do not care about the kind stay simple and still hit an index.
 
-## Question tiers
+## Question families (taxonomy v2)
 
-Per-tier labels are carried on every record. Report per-tier accuracy; do not
-flatten to a single score.
+Questions have one subject family plus independent operation and outcome tags.
+Families are not difficulty levels.
 
-| Tier | Name                      | Templates                                                                                 |
-| ---- | ------------------------- | ----------------------------------------------------------------------------------------- |
-| 1    | existence / lookup        | entity type, method owner, defining file, direct base, has field                          |
-| 2    | path traversal            | path exists, shortest chain, hop count, reachable-within-2, reaches-global-read           |
-| 3    | aggregation over shape    | fan-in, fan-out, reachability-set size, nearest common ancestor, max fan-in, method count |
-| 4    | counterfactual / negative | absent entity, no call path, wrong method owner, no callers, not-inherits                 |
-| 5    | cross-graph composition   | CALLS closure × USES — **reduced scope, off by default** (see limitations)                |
+| Family | Coverage |
+| --- | --- |
+| `definition_organisation` | Definitions, files, direct ownership and members |
+| `dependency_interaction` | Callers/callees, paths, reachability and counts |
+| `inheritance_specialisation` | Ancestry and same-name member declarations |
+| `state_access` | Field/global reads and writes through call paths |
+| `structural_comparison` | Shared/exclusive callees and shared declared methods |
 
-Each record carries: `tier`, `template_id`, `question`, `answer`, `answer_type`,
-`cypher`, `params`, `evidence`, `verification`, and — after rephrasing —
-`question_template` and `naturalization`.
+All five families are enabled by default: 23 existing templates plus four new
+ones. Records carry `family`, `operations`, `relations`, `outcome`,
+`taxonomy_version`, the existing QA/query/evidence fields, and review history.
+Old template IDs and module filenames remain provenance keys. See
+[QUESTION_TAXONOMY.md](QUESTION_TAXONOMY.md) for mapping and answer contracts.
+
+Use repeatable `--family <slug>` to select families and `--per-family 12`
+to target at most 60 questions across five families. Budgets are allocated
+across templates before queries execute; shortages are reported explicitly.
+
+```bash
+cgx generate minirepo --per-family 12 --out data/questions/minirepo-v2.jsonl
+cgx migrate-taxonomy data/questions/minirepo.jsonl --out data/questions/minirepo-migrated-v2.jsonl
+```
+
+Old JSONL is readable directly. Migration writes a new file and preserves IDs,
+answers, evidence and reviews; original tiers are retained in `legacy_taxonomy`.
+Generation protects existing output unless `--overwrite` is explicitly given.
+Evaluation reports family, operation, outcome and template scores; operation
+groups overlap. Scores combine list F1 and exact match, not uniform accuracy.
 
 ## Sampling: what gets turned into a question
 
 Deriving ground truth from a graph is only half the method; **which instances
-are selected** is the other half, and it decides whether a tier is discriminative
+are selected** is the other half, and it decides whether a question family is discriminative
 or trivial. Uniform random sampling over a code graph produces a benchmark
 dominated by boilerplate, because the underlying distributions are heavily
 zero-inflated.
@@ -161,7 +178,7 @@ Measured fraction of **callables** clearing each threshold:
 | neo4j driver (1765)      | 17.5%      | 23.3%       | 32.8%     |
 | Django (9225)            | 16.9%      | 21.6%       | 35.4%     |
 
-~65% of real-repo callables have fan-in 0, so two-thirds of a uniform tier-3
+~65% of real-repo callables have fan-in 0, so two-thirds of a uniform aggregation
 sample would ask "how many callers?" about something nothing calls.
 
 Class method counts are less skewed but degenerate often enough to matter —
@@ -177,22 +194,22 @@ Nearly a third of Django's classes define no methods of their own — marker
 subclasses, lookups, `Meta`-style attribute holders. Uniform sampling made
 `t3_class_method_count` answer 0 for 7 of 12 questions.
 
-**Tier 3 samples the non-trivial tail.** Each metric is computed across all
+**Aggregation templates sample the non-trivial tail.** Each metric is computed across all
 candidates in one pass, and sampling draws only from those clearing a threshold
 — currently 2 for all four: `MIN_FAN_IN`, `MIN_FAN_OUT`, `MIN_REACH`,
 `MIN_METHOD_COUNT`. Every such record carries `evidence.sampled_from` recording
 the threshold it was drawn under, so the filter is visible in the dataset rather
 than implicit in the code. When a repo has fewer non-trivial candidates than
 requested it returns fewer questions rather than quietly relaxing the threshold.
-Zero-valued cases are not lost — they are tier 4's `t4_no_callers`, where
+Zero-valued cases are not lost — they are `t4_no_callers` in the dependency family, where
 "nothing calls this" is the point.
 
-The remaining two tier-3 templates need no threshold: `t3_common_ancestor` is
+The remaining two aggregation templates need no threshold: `t3_common_ancestor` is
 structurally pre-filtered (its sampling query only matches class pairs that
 genuinely share an ancestor) and `t3_max_fan_in` computes one repo-wide answer
 without sampling.
 
-**Tier 2 is stratified by hop length.** Sampling draws a quota per hop bucket
+**Path templates are stratified by hop length.** Sampling draws a quota per hop bucket
 (`2`, `3`, `4+`) rather than from one pool, so accuracy-by-hop-length is a
 reportable, unconfounded result instead of an artefact of graph shape. Each
 record carries `evidence.hop_bucket`. Candidates come from bounded random source
@@ -204,7 +221,7 @@ One trap worth knowing: a `WHERE ... length(p) >= 2` in the same clause as
 path *satisfying the predicate* rather than the true shortest — silently
 labelling genuinely 1-hop pairs as 2-hop. The filter must come after a `WITH`.
 
-**Tier 2 requires a unique shortest path.** `shortestPath()` returns one
+**Shortest-chain questions require a unique shortest path.** `shortestPath()` returns one
 arbitrary path when several tie, which would make the stored chain only one of
 several correct answers. `t2_shortest_chain` checks with `allShortestPaths()`
 and skips tied pairs. `t2_path_exists` and `t2_hop_count` are unaffected: a
@@ -213,11 +230,11 @@ boolean and a length are identical across tied paths.
 **Answer polarity is not predictable from the template.** `t1_has_field` used to
 sample only from existing `HAS_FIELD` edges, so its answer was always `True` —
 a model could score on it via any proxy that correlates with template identity
-(phrasing, persona, tier) without consulting the graph. It now splits its quota
+(phrasing, persona, family) without consulting the graph. It now splits its quota
 between positives and near-miss negatives: a real field name from elsewhere in
 the repo, paired with a class that neither defines nor inherits it.
 
-**Tier 4 negatives are deliberately plausible.** Absent entities recombine a
+**Absent-entity negatives are deliberately plausible.** Absent entities recombine a
 real short name with a real namespace from the same repo
 (`minirepo.models.Base.strip_ws` — both halves real, the pair is not). A
 negative built from a nonsense identifier would be rejectable without consulting
@@ -264,7 +281,7 @@ python -m cgx.cli extract  minirepo       # -> data/graphs/minirepo.json
 python -m cgx.cli ingest   minirepo       # constraints + indexes, then load
 python -m cgx.cli generate minirepo -n 6  # -> data/questions/minirepo.jsonl
 python -m cgx.cli recheck  minirepo       # every answer re-derived from its Cypher
-python -m cgx.cli verify   minirepo --tier 4 --sample 10
+python -m cgx.cli verify   minirepo --family dependency_interaction --sample 10
 python -m cgx.cli verify-report minirepo
 python -m cgx.cli evaluate minirepo --model oracle
 pytest -q
@@ -297,8 +314,9 @@ the checkout root yields `django.django.apps.config` and pulls in `docs/` and
 
 ## Validation status
 
-**32 tests pass.** Every stored answer reproduces from its own Cypher on every
-repo below.
+The table and tier scores below are historical pre-v2 measurements, not a
+validation of the new taxonomy. Run `pytest -q` for current checks. Database
+tests use a disposable repository namespace and require a running Neo4j.
 
 | Repo                   | Files | Nodes | Edges | Notes                          |
 | ---------------------- | ----- | ----- | ----- | ------------------------------ |
@@ -327,10 +345,8 @@ deduplication, not loss: a property's getter/setter/deleter assert the same
   test directories and trivial-valued nodes means the benchmark no longer
   samples the repo's true distribution and makes no claim about test code. This
   belongs in the paper's limitations, not buried in code.
-- **Tier 5 is reduced in scope.** The stretch goal was CALLS × _data-flow_. There
-  is no data-flow extraction here, so tier 5 composes CALLS with the data-access
-  graph (`USES`, read/write). That is genuine two-graph composition but is **not**
-  data-flow and must not be reported as such. Off by default; `--include-tier5`.
+- **State access has bounded scope.** It composes CALLS with USES (read/write),
+  not full data-flow. It is enabled by default under the state-access family.
 - **Property writes are modelled as both a FIELD and a METHOD.** For a property,
   `self.x = v` is really a write through the setter, but the extractor emits
   both nodes. Syntactically faithful and schema-valid, but it slightly inflates
@@ -348,19 +364,20 @@ deduplication, not loss: a property's getter/setter/deleter assert the same
 
 ## Open decisions
 
-- **Tier-4 near-miss negatives.** `t4_no_call_path` still draws random pairs,
+- **Reachability near-miss negatives.** `t4_no_call_path` still draws random pairs,
   and ~90% of random pairs in a real repo are unreachable — so the negative is
   usually trivially distant rather than a genuine near miss. Constraining to
-  pairs that share a module, class, or common caller would make the tier test
+  pairs that share a module, class, or common caller would make these questions test
   understanding rather than distance. (`t4_absent_entity` and
   `t4_wrong_method_owner` already work this way.)
-- **Per-tier and per-repo quotas.** Generation is per-_template_, so tier totals
-  fall out of how many templates a tier happens to have. A ~60-questions-per-repo
-  target across 10 repos needs explicit quotas.
-- **Tier-1 triviality filter.** Dunders and one-line functions are still sampled
+- **Pilot family quotas.** `--per-family` caps family budgets; report actual
+  coverage and shortfalls rather than assuming every target was filled.
+- **Lookup triviality filter.** Dunders and one-line functions are still sampled
   uniformly; ~38% of fixture methods are `__init__`.
-- **Verification state is lost on regenerate.** `generate` overwrites the JSONL,
-  resetting `verification.status`. Merging by question `id` would preserve it.
+- **Explicit regeneration creates review work.** Existing output is protected;
+  `--overwrite` creates fresh pending records. Use `migrate-taxonomy` to retain
+  review decisions while reclassifying existing questions. Ordinal IDs alone
+  cannot safely transfer decisions to regenerated records.
 - **Duplicate edges in the JSON.** The extractor emits the 69 duplicate
   assertions described above, so `edges_total` in the extract stats overcounts
   against what the graph holds. Deduping at emit time would make them agree.
@@ -373,11 +390,12 @@ src/cgx/schema.py          node/edge definitions, identity attrs, validation
 src/cgx/logconfig.py       CLI logging (-v / -q)
 src/cgx/extract/           ast_pass.py (NodeIndex), pyan_pass.py, pipeline.py
 src/cgx/graph/             client.py, ingest.py, cypher/schema.cypher
-src/cgx/qgen/              base.py, tier1..tier5, generate.py
+src/cgx/qgen/              base.py, taxonomy.py, tier1..tier5, generate.py
+                           comparison.py, inheritance.py
                            naturalize.py, providers.py, personas.py, validate.py
 src/cgx/verify/            Phase 3 review CLI
 src/cgx/select/            Phase 4 contamination-aware repo search
-src/cgx/eval/              Phase 5 per-tier scoring harness
+src/cgx/eval/              Family/operation/outcome scoring harness
 fixtures/minirepo/         hand-built repo with known ground truth
 tests/                     ground truth asserted edge by edge
 ```

@@ -30,7 +30,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from .base import QuestionRecord
-from .personas import Persona, personas_for_tier
+from .personas import Persona, personas_for_family
 from .providers import LLMProvider, get_provider
 from .validate import RepoVocabulary, load_vocabulary, validate_rewrite
 
@@ -38,7 +38,7 @@ from .validate import RepoVocabulary, load_vocabulary, validate_rewrite
 #: for why writing questions with a different family than you evaluate on is
 #: worth doing deliberately.
 DEFAULT_MODEL = "anthropic:claude-opus-5"
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2-families"
 
 
 # --------------------------------------------------------------------------
@@ -157,12 +157,12 @@ def _entity_context(rec: QuestionRecord, vocab: RepoVocabulary) -> str:
     return "\n".join(lines) if lines else "- (none)"
 
 
-TIER_INTENT = {
-    1: "a direct lookup of one fact about one entity",
-    2: "whether and how execution reaches one place from another, across multiple call steps",
-    3: "a count or aggregate over the shape of the call/inheritance graph",
-    4: "a check whose true answer is negative — nothing exists, nothing is reachable, nothing calls it",
-    5: "a combination of the call graph and where data is read or written",
+FAMILY_INTENT = {
+    "definition_organisation": "where entities are defined and how code is organised",
+    "dependency_interaction": "relationships between callers, callees and paths in the static call graph",
+    "inheritance_specialisation": "ancestry and explicit member declarations, without assuming runtime dispatch",
+    "state_access": "which code reads or writes fields or globals, including through static call paths",
+    "structural_comparison": "the overlap or difference between two explicitly defined sets of relationships",
 }
 
 
@@ -173,7 +173,9 @@ def build_rewrite_prompt(rec: QuestionRecord, vocab: RepoVocabulary, personas: t
     return f"""\
 Repository: {rec.repo_id}
 
-What this question is fundamentally asking: {TIER_INTENT.get(rec.tier, "a question about code structure")}
+What this question is fundamentally asking: {FAMILY_INTENT[rec.family]}
+
+Preserve all traversal limits, direct/transitive distinctions, and static scope.
 
 Templated question:
 {rec.question}
@@ -217,7 +219,7 @@ class Naturalizer:
         return self.provider.client
 
     def rewrite(self, rec: QuestionRecord, vocab: RepoVocabulary) -> list[Phrasing]:
-        personas = personas_for_tier(rec.tier)[: self.config.per_question]
+        personas = personas_for_family(rec.family)[: self.config.per_question]
         parsed = self.provider.parse(
             system=REWRITE_SYSTEM,
             user=build_rewrite_prompt(rec, vocab, personas),
@@ -227,12 +229,19 @@ class Naturalizer:
         return list(parsed.phrasings) if parsed else []
 
     def judge(self, rec: QuestionRecord, rewrite: str) -> Judgement:
-        parsed = self.provider.parse(
-            system=JUDGE_SYSTEM,
-            user=build_judge_prompt(rec, rewrite),
-            schema=Judgement,
-            max_tokens=1024,
-        )
+        # Same budget as the rewrite: on a thinking model the reasoning tokens
+        # count against max_tokens, and 1024 truncated the verdict mid-JSON.
+        # A judge that cannot answer rejects the rewrite -- one question falls
+        # back to its template instead of the whole run crashing.
+        try:
+            parsed = self.provider.parse(
+                system=JUDGE_SYSTEM,
+                user=build_judge_prompt(rec, rewrite),
+                schema=Judgement,
+                max_tokens=self.config.max_tokens,
+            )
+        except Exception as exc:                      # truncation, network, refusal
+            return Judgement(same_answer=False, reason=f"judge failed: {type(exc).__name__}")
         return parsed or Judgement(same_answer=False, reason="no parsed output / refusal")
 
     def naturalize(self, rec: QuestionRecord, vocab: RepoVocabulary) -> QuestionRecord:
@@ -293,7 +302,7 @@ def build_batch_requests(records: list[QuestionRecord], vocab: RepoVocabulary,
     """One Batches request per question. Results are keyed by `custom_id`."""
     requests = []
     for rec in records:
-        personas = personas_for_tier(rec.tier)[: config.per_question]
+        personas = personas_for_family(rec.family)[: config.per_question]
         requests.append({
             "custom_id": rec.id.replace("::", "__")[:64],
             "params": {

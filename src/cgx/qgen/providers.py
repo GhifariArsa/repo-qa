@@ -94,13 +94,53 @@ class OpenAIProvider:
         return message.parsed
 
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def openrouter_client():
+    """OpenRouter speaks the OpenAI chat-completions API, so it reuses the
+    OpenAI provider with a different base URL and key. Model ids are
+    OpenRouter's (`anthropic/claude-opus-5`, `openai/gpt-5.5`, ...)."""
+    import openai
+
+    # A thinking model can spend 15+ minutes inside ONE call (seen in the
+    # closed-book pilot), which no step or time budget between calls can stop.
+    # Cap each request; a timeout is retried once, then recorded as an error.
+    return openai.OpenAI(base_url=OPENROUTER_BASE_URL, api_key=os.environ["OPENROUTER_API_KEY"],
+                         timeout=240.0, max_retries=1)
+
+
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
+
+
+def ollama_client():
+    """A local Ollama server over its OpenAI-compatible API -- usually the GPU
+    VM reached through an SSH tunnel (`ssh -N -L 11434:127.0.0.1:11434 ...`).
+    Ollama bills nothing and reports no cost, so spend reads as zero. Its
+    `tool_choice` is ignored; the agent loop does not rely on it (see
+    eval/agent.py, final turn)."""
+    import openai
+
+    return openai.OpenAI(base_url=os.environ.get("OLLAMA_BASE_URL", OLLAMA_BASE_URL),
+                         api_key="ollama", timeout=600.0, max_retries=1)
+
+
+def client_for(provider: str):
+    """The OpenAI-compatible client for an agent run's provider."""
+    if provider == "openrouter":
+        return openrouter_client()
+    if provider == "ollama":
+        return ollama_client()
+    raise SystemExit(f"agent runs need provider 'openrouter' or 'ollama', not {provider!r}")
+
+
 def parse_model_spec(spec: str) -> tuple[str, str]:
     """`"openai:gpt-4.1"` -> `("openai", "gpt-4.1")`."""
     if ":" in spec:
         provider, _, model = spec.partition(":")
         provider = provider.strip().lower()
-        if provider not in ("anthropic", "openai"):
-            raise SystemExit(f"unknown provider {provider!r}; use 'anthropic' or 'openai'")
+        if provider not in ("anthropic", "openai", "openrouter", "ollama"):
+            raise SystemExit(f"unknown provider {provider!r}; use 'anthropic', 'openai', 'openrouter' or 'ollama'")
         if not model.strip():
             raise SystemExit(f"model spec {spec!r} has no model id after the provider")
         return provider, model.strip()
@@ -116,6 +156,12 @@ def _require_credentials(provider: str) -> None:
     if provider == "openai":
         if not os.environ.get("OPENAI_API_KEY"):
             raise SystemExit("OPENAI_API_KEY is not set")
+        return
+    if provider == "openrouter":
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            raise SystemExit("OPENROUTER_API_KEY is not set")
+        return
+    if provider == "ollama":
         return
     # Anthropic resolves a key OR an `ant auth login` profile, so an unset
     # env var is not by itself an error — only warn when neither is present.
@@ -134,4 +180,8 @@ def get_provider(spec: str, client: Any = None) -> LLMProvider:
         _require_credentials(provider)
     if provider == "openai":
         return OpenAIProvider(model=model, client=client)
+    if provider == "openrouter":
+        return OpenAIProvider(model=model, client=client or openrouter_client(), name="openrouter")
+    if provider == "ollama":
+        return OpenAIProvider(model=model, client=client or ollama_client(), name="ollama")
     return AnthropicProvider(model=model, client=client)

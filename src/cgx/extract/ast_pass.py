@@ -384,7 +384,17 @@ class _ModuleVisitor(ast.NodeVisitor):
         caller = self._enclosing_callable
         name = _callee_name(node.func)
         if caller is not None and name is not None:
-            self.r.call_sites.setdefault(caller, defaultdict(list))[name].append(node.lineno)
+            sites = self.r.call_sites.setdefault(caller, defaultdict(list))
+            sites[name].append(node.lineno)
+            # `from .joiner import cli as remote_cli; remote_cli()` calls `cli`.
+            # Recording only the local alias made the call-site cross-check
+            # reject pyan's correct edge to `joiner.cli` -- and the completeness
+            # annotation, which matches by the same short names, never flagged
+            # it as missed either. Record the imported name as well.
+            if isinstance(node.func, ast.Name) and name in self.imports:
+                original = self.imports[name].rsplit(".", 1)[-1]
+                if original != name:
+                    sites[original].append(node.lineno)
         self.generic_visit(node)
 
 

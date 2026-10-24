@@ -10,7 +10,7 @@ from __future__ import annotations
 import random
 
 from .base import make_question, template
-from ._util import pick
+from ._util import split_quota, pick
 
 _SAMPLE_ENTITIES = """
 MATCH (n:CodeNode {repo_id: $repo})
@@ -219,8 +219,7 @@ def _has_field_question(client, repo_id, index, cls, field):
 @template("t1_has_field", 1)
 def t1_has_field(client, repo_id, limit, rng: random.Random):
     """Roughly balanced True/False, so the answer is not predictable from the template."""
-    n_positive = (limit + 1) // 2
-    n_negative = limit - n_positive
+    n_positive, n_negative = split_quota(limit, rng)
 
     out = []
     for row in pick(rng, client.run(_SAMPLE_FIELDS, repo=repo_id), n_positive):

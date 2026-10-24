@@ -236,3 +236,70 @@ def test_colliding_repo_passes_schema_validation(tmp_path):
     """extract_repo() calls validate_graph() internally — this used to raise."""
     graph, _ = _extract_source(tmp_path, COLLIDING_SOURCE)
     assert len(graph.nodes) > 0 and len(graph.edges) > 0
+
+
+def test_src_layout_scopes_extraction_and_keeps_repo_relative_paths(tmp_path):
+    """package_root inside the repo (`src/`) must not crash on `scripts/`, and
+    file paths must stay relative to the repo root, not the package root."""
+    from cgx.extract.pipeline import extract_repo
+
+    repo = tmp_path / "proj"
+    (repo / "src" / "pkg").mkdir(parents=True)
+    (repo / "src" / "pkg" / "__init__.py").write_text("")
+    (repo / "src" / "pkg" / "core.py").write_text("def f():\n    return 1\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "tool.py").write_text("def g():\n    return 2\n")
+
+    graph, _ = extract_repo("srclayout", repo, repo / "src")
+
+    by_qname = {n.qname: n for n in graph.nodes}
+    assert "pkg.core.f" in by_qname
+    assert by_qname["pkg.core.f"].file_path == "src/pkg/core.py"
+    assert not any("tool" in q for q in by_qname)
+
+
+def test_unresolvable_receiver_calls_are_flagged_on_both_ends(tmp_path):
+    """The pilot's `agent = laya.load(...); agent.accelerate()`: static
+    resolution cannot type `agent`, so the CALLS edge never appears. Both the
+    caller (may be missing an outgoing call) and `accelerate` (may be missing an
+    incoming one) must say so; a call that did resolve must not."""
+    from cgx.extract.pipeline import extract_repo
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "agent.py").write_text(
+        "class Agent:\n"
+        "    def accelerate(self):\n        return 1\n"
+        "    def warm(self):\n        return self.accelerate()\n"
+        "def load():\n    return Agent()\n")
+    (pkg / "bench.py").write_text(
+        "from pkg.agent import load\n"
+        "def run():\n    agent = load()\n    return agent.accelerate()\n")
+    graph, meta = extract_repo("unres", pkg, tmp_path)
+    by = {n.qname: n for n in graph.nodes}
+
+    assert by["pkg.bench.run"].unresolved_out == 1          # agent.accelerate() missed
+    assert by["pkg.agent.Agent.accelerate"].unresolved_in == 1
+    assert by["pkg.agent.Agent.warm"].unresolved_out == 0   # self.accelerate() resolved
+    assert by["pkg.agent.load"].unresolved_in == 0          # load() resolved via import
+    assert meta["stats"]["completeness"]["callables_incomplete_out"] == 1
+
+
+def test_aliased_import_call_is_kept(tmp_path):
+    """`from .joiner import cli as remote_cli; remote_cli()` is a call to `cli`.
+    The call-site cross-check used to reject pyan's edge because the call site
+    was recorded only under the alias (openworker: coworker.cli.main)."""
+    from cgx.extract.pipeline import extract_repo
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "joiner.py").write_text("def cli(args):\n    return args\n")
+    (pkg / "main.py").write_text(
+        "def main(argv):\n"
+        "    from .joiner import cli as remote_cli\n"
+        "    return remote_cli(argv)\n"
+    )
+    graph, _ = extract_repo("alias", tmp_path, tmp_path)
+    assert ("pkg.main.main", "pkg.joiner.cli") in edges_of(graph, "CALLS")

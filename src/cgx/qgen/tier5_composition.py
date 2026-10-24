@@ -17,7 +17,7 @@ from __future__ import annotations
 import random
 
 from .base import make_question, template
-from ._util import callables, pick
+from ._util import callables, pick, rebalance, split_quota
 
 _GT_CLOSURE_READS = """
 MATCH (s:CodeNode {repo_id: $repo, qname: $source})
@@ -58,34 +58,80 @@ WHERE u.access = 'write'
 RETURN count(u) > 0 AS written, collect(DISTINCT f.qname) AS writers
 """
 
-_SAMPLE_WRITTEN_FIELDS = """
-MATCH (:CodeNode {repo_id: $repo})-[u:USES {access: 'write'}]->(f:FIELD)
-RETURN DISTINCT f.qname AS field
-ORDER BY f.qname
+#: A field's writers, and the callers that reach each writer: every candidate
+#: found walking backwards from a real write is a "yes" by construction.
+_FIELD_WRITERS = """
+MATCH (w:CodeNode {repo_id: $repo})-[:USES {access: 'write'}]->(f:FIELD)
+WHERE w:FUNCTION OR w:METHOD
+RETURN w.qname AS writer, f.qname AS field
+ORDER BY field, writer
 """
+_CALLERS_REACHING_WRITER = """
+MATCH (c:CodeNode {repo_id: $repo})-[:CALLS*0..6]->(:CodeNode {repo_id: $repo, qname: $writer})
+WHERE c:FUNCTION OR c:METHOD
+RETURN DISTINCT c.qname AS caller ORDER BY caller LIMIT 50
+"""
+
+
+def _writes_field_question(client, repo_id, index, source, fld, polarity):
+    res = client.run(_GT_CLOSURE_WRITES_FIELD, repo=repo_id, source=source, field=fld)[0]
+    return make_question(
+        tier=5, template_id="t5_closure_writes_field", repo_id=repo_id, index=index,
+        question=(
+            f"If `{source}` runs, can the attribute `{fld}` be assigned to -- either in "
+            f"`{source}` itself or in anything it calls, directly or transitively?"
+        ),
+        answer=bool(res["written"]), answer_type="bool",
+        cypher=_GT_CLOSURE_WRITES_FIELD, params={"repo": repo_id, "source": source, "field": fld},
+        evidence={"writers": sorted(w for w in res["writers"] if w), "polarity": polarity,
+                  "composition": "CALLS closure x USES(write) over FIELD"},
+    )
 
 
 @template("t5_closure_writes_field", 5)
 def t5_closure_writes_field(client, repo_id, limit, rng: random.Random):
-    fields = [r["field"] for r in client.run(_SAMPLE_WRITTEN_FIELDS, repo=repo_id)]
-    calls = callables(client, repo_id)
-    if not fields or not calls:
+    """Half yes, half no.
+
+    Random (callable, field) pairs almost never write, so this template came
+    out "no" on all 40 questions and a constant guess scored perfectly. The
+    "yes" side is now built backwards from a real write; the "no" side draws a
+    callable from the field's own class or module, so proximity is no tell.
+    """
+    writes = client.run(_FIELD_WRITERS, repo=repo_id)
+    if not writes:
         return []
-    pairs = [(c["qname"], f) for c in calls for f in fields]
+    n_yes, n_no = split_quota(limit, rng)
     out = []
-    for source, fld in pick(rng, pairs, max(limit * 5, 30)):
-        res = client.run(_GT_CLOSURE_WRITES_FIELD, repo=repo_id, source=source, field=fld)[0]
-        out.append(make_question(
-            tier=5, template_id="t5_closure_writes_field", repo_id=repo_id, index=len(out),
-            question=(
-                f"If `{source}` runs, can the attribute `{fld}` be assigned to -- either in "
-                f"`{source}` itself or in anything it calls, directly or transitively?"
-            ),
-            answer=bool(res["written"]), answer_type="bool",
-            cypher=_GT_CLOSURE_WRITES_FIELD, params={"repo": repo_id, "source": source, "field": fld},
-            evidence={"writers": sorted(w for w in res["writers"] if w),
-                      "composition": "CALLS closure x USES(write) over FIELD"},
-        ))
-        if len(out) >= limit:
+    for row in pick(rng, writes, max(n_yes * 4, 20)):
+        if len(out) >= n_yes:
             break
-    return out
+        callers = [r["caller"] for r in client.run(_CALLERS_REACHING_WRITER, repo=repo_id, writer=row["writer"])]
+        if not callers:
+            continue
+        rec = _writes_field_question(client, repo_id, len(out), rng.choice(callers), row["field"],
+                                     "reaches_writer")
+        if rec.answer is True:
+            out.append(rec)
+
+    names = [c["qname"] for c in callables(client, repo_id)]
+    added, seen = 0, set()
+    candidates = pick(rng, writes, max(n_no * 10, 50))
+    for attempt, row in enumerate(candidates * 2):
+        if added >= n_no:
+            break
+        owner = row["field"].rsplit(".", 1)[0]          # the field's class
+        module = owner.rsplit(".", 1)[0]
+        # Near misses from the field's own class or module first; once those
+        # run dry, any callable.
+        near = ([q for q in names if q.startswith(owner + ".")]
+                or [q for q in names if q.startswith(module + ".")]) if attempt < len(candidates) else []
+        near = near or names
+        src = rng.choice(near)
+        if (src, row["field"]) in seen:
+            continue
+        seen.add((src, row["field"]))
+        rec = _writes_field_question(client, repo_id, len(out), src, row["field"], "nearby_non_writer")
+        if rec.answer is False:
+            out.append(rec)
+            added += 1
+    return rebalance(out)
